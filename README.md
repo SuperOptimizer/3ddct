@@ -134,6 +134,31 @@ regardless of dtype. Synthetic blocks at `q=1.0`, RMSE as a fraction of the
 value range: u8 ≈ 0.36 %, u16 ≈ 0.4 %, u32 ≈ 0.4 %, f32 ≈ 0.4 %. Absolute `tau`
 is honored exactly for every type (e.g. f32 `tau=0.00998` → max error 0.00998).
 
+## Performance
+
+Single-threaded throughput on an **Apple M4** (Homebrew clang 22,
+`-O3 -ffast-math -march=native`), measured over the dense-center scroll blocks
+above (u8, one 16³ block = 4096 voxels = 4 KB raw):
+
+```
+  q      encode              decode
+         MB/s   ns/block      MB/s   ns/block
+  ----------------------------------------------
+  q1     104     39300        87     46900
+  q4     146     28100       139     29400
+  q16    175     23400       181     22700
+  q64    197     20800       213     19200
+```
+
+Throughput rises with `quality` because there are fewer significant coefficients
+to range-code. MB/s is of raw voxel data; a block is ~20–47 µs each way.
+
+Because the codec is **thread-free and every block is independent**, it scales
+out trivially — the same M4 across its 10 cores (OpenMP, one block per work
+item) hits **~624 MB/s encode at q1 and ~1.04 GB/s at q16**, ~6× the
+single-thread rate. There are no locks or shared writable state to contend on;
+the only shared read is the static cosine table.
+
 ## Notes & caveats
 
 - **Lossy.** Reconstruction is close, not bit-exact.
