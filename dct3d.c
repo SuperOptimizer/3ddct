@@ -14,6 +14,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define N        DCT3D_N
@@ -28,20 +29,23 @@
 // ============================================================================
 // Orthonormal separable DCT-II cosine matrix, built on first use.
 //   cm[k][n] = ck * cos(pi*(2n+1)*k / 2N),  ck = sqrt(1/N) (k=0) else sqrt(2/N)
-// Orthonormal, so the inverse (DCT-III) is the transpose. First-callers race
-// only to write identical values (idempotent), so the codec stays lock-free.
+// Orthonormal, so the inverse (DCT-III) is the transpose. Concurrent first
+// callers race only to write identical values, but the ready flag needs a
+// release store / acquire load pair: on weakly-ordered ISAs (ARM) a plain flag
+// could be observed set before the table stores land, letting a reader see
+// zeros. Still lock-free — no mutex, just publish ordering.
 // ============================================================================
 static float g_cm[N][N];
-static int   g_cm_ready = 0;
+static atomic_int g_cm_ready = 0;
 
 static void dct_init(void) {
-    if (g_cm_ready) return;
+    if (atomic_load_explicit(&g_cm_ready, memory_order_acquire)) return;
     for (int k = 0; k < N; ++k) {
         double ck = (k == 0) ? sqrt(1.0 / N) : sqrt(2.0 / N);
         for (int n = 0; n < N; ++n)
             g_cm[k][n] = (float)(ck * cos(M_PI * (2.0 * n + 1.0) * k / (2.0 * N)));
     }
-    g_cm_ready = 1;
+    atomic_store_explicit(&g_cm_ready, 1, memory_order_release);
 }
 
 // 1D forward DCT-II of one length-16 line, even/odd butterfly (half the MACs).
@@ -125,11 +129,11 @@ static void dct3_inv(const float *restrict coef, float *restrict blk,
 // lock-free pattern as the cosine table) so step_build is a scalar multiply
 // per coefficient instead of a powf. Bit-identical to the old triple-powf loop.
 static float g_hfw[3 * (N - 1) + 1];
-static int   g_hfw_ready = 0;
+static atomic_int g_hfw_ready = 0;
 static void hfw_init(void) {
-    if (g_hfw_ready) return;
+    if (atomic_load_explicit(&g_hfw_ready, memory_order_acquire)) return;
     for (int f = 0; f <= 3 * (N - 1); ++f) g_hfw[f] = powf(1.0f + (float)f, HF_EXP);
-    g_hfw_ready = 1;
+    atomic_store_explicit(&g_hfw_ready, 1, memory_order_release);
 }
 static void step_build(float qstep, float step_tab[N3]) {
     for (int cz = 0; cz < N; ++cz) for (int cy = 0; cy < N; ++cy) for (int cx = 0; cx < N; ++cx) {
@@ -327,11 +331,11 @@ static rc_u32 dec_magnitude(rc_dec *d, coef_ctx *ac) {
 // Ascending-L1-frequency scan order over the 16^3 coefficient cube. It is a
 // pure function of the fixed geometry (same table every call), so it is built
 // once by counting sort into a shared table rather than rebuilt per block.
-// Idempotent write, same lock-free pattern as the cosine table.
+// Idempotent write, same release/acquire publish pattern as the cosine table.
 static uint16_t g_scan[N3];
-static int      g_scan_ready = 0;
+static atomic_int g_scan_ready = 0;
 static void scan_init(void) {
-    if (g_scan_ready) return;
+    if (atomic_load_explicit(&g_scan_ready, memory_order_acquire)) return;
     enum { FMAX = 3 * (N - 1) };   // max L1 frequency = 45
     int hist[FMAX + 2];
     for (int i = 0; i < FMAX + 2; ++i) hist[i] = 0;
@@ -344,7 +348,7 @@ static void scan_init(void) {
         int cz = idx / (N * N), cy = (idx / N) % N, cx = idx % N;
         g_scan[hist[cz + cy + cx]++] = (uint16_t)idx;
     }
-    g_scan_ready = 1;
+    atomic_store_explicit(&g_scan_ready, 1, memory_order_release);
 }
 static inline int band_of(rc_u32 idx) {
     rc_u32 cz = idx / (N * N), cy = (idx / N) % N, cx = idx % N, freq = cz + cy + cx;
@@ -501,7 +505,10 @@ static size_t encode_float(const float *blk_in, float vmin, float vspan,
     rc_enc e; enc_init(&e, p, DCT3D_MAX_BYTES - HDR_BYTES);
     enc_fval(&e, vmin);
     enc_fval(&e, vspan);
-    { uint32_t qb; memcpy(&qb, &qstep, 4); enc_bypass_n(&e, qb, 32); }
+    // enc_fval is lossless in both branches, so qstep still reproduces the
+    // step table bit-for-bit; typical qualities (1,2,4..64) hit the integer
+    // path at ~5-13 bits instead of 32 raw (+3-5% ratio at high quality).
+    enc_fval(&e, qstep);
     enc_seg(&e, dcq_i);
     ctx_t cflag; ctx_init(&cflag);
     enc_bit(&e, &cflag, ncorr > 0);
@@ -509,14 +516,14 @@ static size_t encode_float(const float *blk_in, float vmin, float vspan,
     enc_coefs(&e, lvl, g_scan);
 
     if (ncorr > 0) {
-        // Correction stream: [eg count][f32 cq][ {eg gap, sign, eg(|delta|-1)} ]*.
+        // Correction stream: [eg count][fval cq][ {eg gap, sign, eg(|delta|-1)} ]*.
         // delta is err/cq rounded to the nearest nonzero integer, so the applied
         // correction is delta*cq and the residual is < 0.5*cq normalized (=>
         // < 0.5*cq*vspan/255 raw), meeting tau by construction. cq rides in the
-        // stream (corrections-only, 32 bypass bits) since the decoder does not
-        // know tau. For narrow-range data cq==1 and deltas are small integers.
+        // stream (corrections-only) since the decoder does not know tau; the
+        // common case cq==1.0 hits enc_fval's integer path at ~3 bits.
         enc_eg(&e, (rc_u32)(ncorr - 1));
-        uint32_t cqb; memcpy(&cqb, &cq, 4); enc_bypass_n(&e, cqb, 32);
+        enc_fval(&e, cq);
         rc_u32 prev = 0;
         for (int c = 0; c < ncorr; ++c) {
             enc_eg(&e, (rc_u32)cpos[c] - prev); prev = cpos[c];
@@ -543,7 +550,7 @@ static int decode_float(const uint8_t *blob, size_t len, int want_dtype, float *
     rc_dec d; dec_init(&d, p, len - HDR_BYTES);
     float vmin  = dec_fval(&d);
     float vspan = dec_fval(&d);
-    uint32_t qb = dec_bypass_n(&d, 32); float qstep; memcpy(&qstep, &qb, 4);
+    float qstep = dec_fval(&d);
     float dc    = (float)dec_seg(&d) / (float)DC_Q;
     if (!(vspan > 0.0f) || !(qstep > 0.0f) ||
         !isfinite(vmin) || !isfinite(dc)) return 0;
@@ -567,7 +574,7 @@ static int decode_float(const uint8_t *blob, size_t len, int want_dtype, float *
         // both so decoding can never read or write out of bounds.
         rc_u32 ncorr = dec_eg(&d) + 1, pos = 0;
         if (ncorr > (rc_u32)N3) ncorr = N3;
-        uint32_t cqb = dec_bypass_n(&d, 32); float cq; memcpy(&cq, &cqb, 4);
+        float cq = dec_fval(&d);
         if (!(cq > 0.0f) || !isfinite(cq)) cq = 1.0f;   // corrupt guard
         for (rc_u32 c = 0; c < ncorr; ++c) {
             pos += dec_eg(&d);

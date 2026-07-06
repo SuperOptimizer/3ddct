@@ -21,14 +21,15 @@
 //     #include "dct3d.h"
 //     uint16_t chunk[16*16*16];        // your data, z-major (z*256 + y*16 + x)
 //     uint8_t  out[DCT3D_MAX_BYTES];   // worst-case output buffer
-//     size_t   n = dct3d_encode_u16(chunk, 1.0f, 0.0f, out);
+//     size_t   n = dct3d_encode_u16(chunk, /*quality*/1.0f, /*max_error*/0.0f,
+//                                   /*tau*/0.0f, out);
 //     uint16_t back[16*16*16];
 //     dct3d_decode_u16(out, n, back);
 //
 // The `quality` argument is the quantizer coarseness (smaller = higher
-// fidelity, larger file). The `max_error` argument (relative, in [0,1)) adds a
-// sparse exact-residual correction pass that bounds the per-voxel error to
-// `max_error * chunk_value_range`; pass 0 to disable it.
+// fidelity, larger file). `max_error` (relative, in [0,1)) and `tau` (absolute,
+// in raw input units) each enable a sparse correction pass bounding the
+// per-voxel error; pass 0 to disable either.
 
 #ifndef DCT3D_H
 #define DCT3D_H
