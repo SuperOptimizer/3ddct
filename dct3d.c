@@ -163,6 +163,19 @@ typedef struct { uint16_t p0; } ctx_t;   // adaptive P(bit==0) in 1/4096 units
 #define RC_TOP (1u << 24)
 
 static inline void ctx_init(ctx_t *c) { c->p0 = 1u << 11; }
+static inline void ctx_init_p(ctx_t *c, uint16_t p0) { c->p0 = p0 ? p0 : (1u << 11); }
+
+// Optional prior training. Compiled in with -DDCT3D_TRAIN: each context-coded
+// bit is tallied by (class, slot) so a training run can dump the stationary
+// P(bit==0) per context. Off by default (zero cost).
+#ifdef DCT3D_TRAIN
+enum { TR_SIG=0, TR_MAG=1, TR_EOB=2, TR_NCLS=3 };
+#define TR_SLOTS 32
+long g_tr_n[TR_NCLS][TR_SLOTS], g_tr_z[TR_NCLS][TR_SLOTS];
+#define TRAIN(cls,slot,bit) do{ if((slot)<TR_SLOTS){ g_tr_n[cls][slot]++; g_tr_z[cls][slot]+=((bit)==0); } }while(0)
+#else
+#define TRAIN(cls,slot,bit) ((void)0)
+#endif
 
 static void enc_init(rc_enc *e, rc_u8 *buf, size_t cap) {
     e->buf = buf; e->cap = cap; e->len = 0; e->low = 0; e->range = 0xFFFFFFFFu; e->cache = 0; e->cache_size = 1;
@@ -270,17 +283,34 @@ typedef struct {
     ctx_t mag[MAGCTX];
     ctx_t eob[EOB_CTX];
 } coef_ctx;
+
+// Static priors: P(bit==0) in 1/4096 units per context, trained on PHercParis4
+// 2.4um dense scroll blocks across q in {1..64} (tools: DCT3D_TRAIN build). Per-
+// block contexts reset every 4096-voxel block, so without priors each adaptive
+// bin spends its first ~32 bits no better than a coin flip; seeding from the
+// corpus stationary distribution recovers that. 2048 == untrained/neutral slot.
+static const uint16_t PRI_SIG[NB_BANDS * 4] = {
+    1980, 575, 846, 743, 3916,3707,3515,1463, 3969,3753,3527,2313, 4002,3826,3635,2819,
+    4039,3851,3613,2974, 3985,3840,3703,3475, 4021,3991,3951,3969, 4065,4024,2048,2048,
+};
+static const uint16_t PRI_MAG[MAGCTX] = {
+    1893,1217,908,728,610,527,465,416,377,346,320,297,
+};
+static const uint16_t PRI_EOB[EOB_CTX] = {
+    74,1,1,1,1,5,109,504,772,1063,1458,2326,4095,2048,
+};
+
 static void coef_ctx_init(coef_ctx *a) {
-    for (size_t i = 0; i < sizeof a->sig / sizeof a->sig[0]; ++i) ctx_init(&a->sig[i]);
-    for (int i = 0; i < MAGCTX;  ++i) ctx_init(&a->mag[i]);
-    for (int i = 0; i < EOB_CTX; ++i) ctx_init(&a->eob[i]);
+    for (size_t i = 0; i < sizeof a->sig / sizeof a->sig[0]; ++i) ctx_init_p(&a->sig[i], PRI_SIG[i]);
+    for (int i = 0; i < MAGCTX;  ++i) ctx_init_p(&a->mag[i], PRI_MAG[i]);
+    for (int i = 0; i < EOB_CTX; ++i) ctx_init_p(&a->eob[i], PRI_EOB[i]);
 }
 
 static void enc_magnitude(rc_enc *e, coef_ctx *ac, rc_u32 m) {
     ctx_t *mag = ac->mag; rc_u32 v = m - 1, k = 0;
-    while (k < (rc_u32)(MAGCTX - 1) && v > 0) { enc_bit(e, &mag[k], 1); v -= 1; k++; if (v == 0) { enc_bit(e, &mag[k], 0); return; } }
-    if (v == 0) { enc_bit(e, &mag[k], 0); return; }
-    enc_bit(e, &mag[k], 1);
+    while (k < (rc_u32)(MAGCTX - 1) && v > 0) { TRAIN(TR_MAG,k,1); enc_bit(e, &mag[k], 1); v -= 1; k++; if (v == 0) { TRAIN(TR_MAG,k,0); enc_bit(e, &mag[k], 0); return; } }
+    if (v == 0) { TRAIN(TR_MAG,k,0); enc_bit(e, &mag[k], 0); return; }
+    TRAIN(TR_MAG,k,1); enc_bit(e, &mag[k], 1);
     rc_u32 x = v, nbits = 0, tt = x + 1; while (tt > 1) { tt >>= 1; nbits++; }
     for (rc_u32 i = 0; i < nbits; ++i) enc_bypass(e, 1); enc_bypass(e, 0);
     if (nbits) enc_bypass_n(e, (x + 1) & ((1u << nbits) - 1), (int)nbits);
@@ -324,8 +354,8 @@ static inline int band_of(rc_u32 idx) {
 static void enc_eob(rc_enc *e, coef_ctx *c, rc_u32 v) {
     int kmax = 0; while ((1u << kmax) <= (rc_u32)N3) kmax++;
     int k = 0; while ((1u << k) <= v) k++;
-    for (int i = 0; i < k; ++i) enc_bit(e, &c->eob[i], 1);
-    if (k < kmax) enc_bit(e, &c->eob[k], 0);
+    for (int i = 0; i < k; ++i) { TRAIN(TR_EOB,i,1); enc_bit(e, &c->eob[i], 1); }
+    if (k < kmax) { TRAIN(TR_EOB,k,0); enc_bit(e, &c->eob[k], 0); }
     if (k > 1) enc_bypass_n(e, v & ((1u << (k - 1)) - 1), k - 1);
 }
 static rc_u32 dec_eob(rc_dec *d, coef_ctx *c) {
@@ -345,7 +375,7 @@ static void enc_coefs(rc_enc *e, const float *lvl, const uint16_t *scan) {
     for (rc_u32 p = 0; p < eob; ++p) {
         rc_u32 idx = scan[p]; int b = band_of(idx); float v = lvl[idx];
         int dens = __builtin_popcount(hist & 0xFFFFu); dens = dens < 3 ? dens : 3;
-        if (p != eob - 1) enc_bit(e, &ac.sig[b * 4 + dens], v != 0.0f);
+        if (p != eob - 1) { TRAIN(TR_SIG, b * 4 + dens, v != 0.0f); enc_bit(e, &ac.sig[b * 4 + dens], v != 0.0f); }
         hist = (hist << 1) | (v != 0.0f);
         if (v == 0.0f) continue;
         rc_u32 m = (rc_u32)fabsf(v);
@@ -603,13 +633,18 @@ int    dct3d_decode_u8 (const uint8_t  *blob, size_t len, uint8_t  *chunk) { DEC
 size_t dct3d_encode_u16(const uint16_t *chunk, float quality, float max_error, float tau, uint8_t *out) { ENC_BODY(uint16_t, DT_U16, roundf, 0, 65535); }
 int    dct3d_decode_u16(const uint8_t  *blob, size_t len, uint16_t *chunk) { DEC_BODY(uint16_t, DT_U16, roundf, 0, 65535); }
 size_t dct3d_encode_u32(const uint32_t *chunk, float quality, float max_error, float tau, uint8_t *out) { ENC_BODY(uint32_t, DT_U32, roundf, 0, 4294967295.0); }
-int    dct3d_decode_u32(const uint8_t  *blob, size_t len, uint32_t *chunk) { DEC_BODY(uint32_t, DT_U32, roundf, 0, 4294967295.0); }
+// Decode HI is the largest float <= UINT32_MAX (4294967295 is not representable
+// as a float; (float)that rounds up to 2^32 and casting it back is UB). Values
+// this large already carry the 2^24 float-precision loss, so the clamp is moot.
+int    dct3d_decode_u32(const uint8_t  *blob, size_t len, uint32_t *chunk) { DEC_BODY(uint32_t, DT_U32, roundf, 0, 4294967040.0); }
 size_t dct3d_encode_s8 (const int8_t   *chunk, float quality, float max_error, float tau, uint8_t *out) { ENC_BODY(int8_t,   DT_S8,  roundf, -128, 127); }
 int    dct3d_decode_s8 (const uint8_t  *blob, size_t len, int8_t   *chunk) { DEC_BODY(int8_t,   DT_S8,  roundf, -128, 127); }
 size_t dct3d_encode_s16(const int16_t  *chunk, float quality, float max_error, float tau, uint8_t *out) { ENC_BODY(int16_t,  DT_S16, roundf, -32768, 32767); }
 int    dct3d_decode_s16(const uint8_t  *blob, size_t len, int16_t  *chunk) { DEC_BODY(int16_t,  DT_S16, roundf, -32768, 32767); }
 size_t dct3d_encode_s32(const int32_t  *chunk, float quality, float max_error, float tau, uint8_t *out) { ENC_BODY(int32_t,  DT_S32, roundf, -2147483648.0, 2147483647.0); }
-int    dct3d_decode_s32(const uint8_t  *blob, size_t len, int32_t  *chunk) { DEC_BODY(int32_t,  DT_S32, roundf, -2147483648.0, 2147483647.0); }
+// Decode HI is the largest float < 2^31 (2147483647 rounds up to 2^31 as a
+// float, which overflows int32 on cast). Same 2^24 precision caveat applies.
+int    dct3d_decode_s32(const uint8_t  *blob, size_t len, int32_t  *chunk) { DEC_BODY(int32_t,  DT_S32, roundf, -2147483648.0, 2147483520.0); }
 
 // f32: store verbatim (no rounding, no clamp). ROUND is identity; range is
 // the full float line, so clampf is a no-op.

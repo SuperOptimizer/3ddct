@@ -93,20 +93,20 @@ with `tau = 2·quality`:
 ```
 setting        ratio   b/vox   PSNR    MAE    SSIM     err p90/p95/p99/max
 ------------------------------------------------------------------------
-q1              6.2x   0.167  50.14  0.515  0.9997     1 /  2 /  2 /  7
-q1  tau=2       5.2x   0.195  50.67  0.483  0.9997     1 /  1 /  2 /  2
-q2              9.8x   0.105  47.00  0.814  0.9994     2 /  2 /  3 /  9
-q2  tau=4       9.3x   0.110  47.11  0.806  0.9994     2 /  2 /  3 /  4
-q4             15.6x   0.065  43.93  1.208  0.9988     3 /  3 /  4 / 14
-q4  tau=8      15.5x   0.066  43.95  1.207  0.9988     3 /  3 /  4 /  8
-q8             25.1x   0.040  40.84  1.746  0.9975     4 /  5 /  7 / 22
-q8  tau=16     25.0x   0.040  40.84  1.746  0.9975     4 /  5 /  7 / 16
-q16            40.7x   0.025  37.77  2.486  0.9948     5 /  7 / 10 / 35
-q16 tau=32     40.6x   0.025  37.77  2.486  0.9948     5 /  7 / 10 / 30
-q32            65.0x   0.015  34.81  3.478  0.9894     7 / 10 / 14 / 50
-q32 tau=64     65.0x   0.015  34.81  3.478  0.9894     7 / 10 / 14 / 50
-q64            99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
-q64 tau=128    99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
+q1              6.4x   0.163  50.14  0.515  0.9997     1 /  2 /  2 /  7
+q1  tau=2       5.3x   0.191  50.67  0.483  0.9997     1 /  1 /  2 /  2
+q2             10.1x   0.101  47.00  0.814  0.9994     2 /  2 /  3 /  9
+q2  tau=4       9.6x   0.106  47.11  0.806  0.9994     2 /  2 /  3 /  4
+q4             16.4x   0.062  43.93  1.208  0.9988     3 /  3 /  4 / 14
+q4  tau=8      16.2x   0.063  43.95  1.207  0.9988     3 /  3 /  4 /  8
+q8             26.9x   0.038  40.84  1.746  0.9975     4 /  5 /  7 / 22
+q8  tau=16     26.8x   0.038  40.84  1.746  0.9975     4 /  5 /  7 / 16
+q16            43.8x   0.023  37.77  2.486  0.9948     5 /  7 / 10 / 35
+q16 tau=32     43.8x   0.023  37.77  2.486  0.9948     5 /  7 / 10 / 30
+q32            69.6x   0.014  34.81  3.478  0.9894     7 / 10 / 14 / 50
+q32 tau=64     69.6x   0.014  34.81  3.478  0.9894     7 / 10 / 14 / 50
+q64           103.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
+q64 tau=128   103.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
 ```
 
 - **ratio** = raw ÷ compressed; **b/vox** = bytes per voxel (raw is 1.0).
@@ -117,8 +117,8 @@ q64 tau=128    99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
 ### Reading the numbers
 
 - **q1 ≈ visually lossless:** ~6× smaller, 50 dB, SSIM 0.9997, 99 % of voxels
-  off by ≤2. **q8 ≈ 25×** still holds 41 dB / 0.997 SSIM.
-- **Graceful high end:** q64 reaches ~99× at 32 dB and SSIM still 0.98 — a
+  off by ≤2. **q8 ≈ 27×** still holds 41 dB / 0.997 SSIM.
+- **Graceful high end:** q64 reaches ~103× at 32 dB and SSIM still 0.98 — a
   usable preview at ~0.01 bytes/voxel.
 - **`tau` does what it says.** The `max` error column collapses to exactly `tau`
   wherever the bound bites (`q1 tau=2` → max 2, `q2 tau=4` → max 4, …). Because
@@ -126,10 +126,12 @@ q64 tau=128    99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
   the bound is nearly free: `q2 tau=4` costs ~5 % over plain `q2`, and by q≥16
   the natural error is already under `2q`, so `tau=2q` is a no-op (identical
   rows).
-- The header (block mean + value range) is entropy-coded into the same range
-  stream rather than stored as a raw 18-byte struct, which is why the ratio win
-  grows with quality (the header used to dominate small high-q blobs) — up to
-  ~+13 % at q64, at byte-for-byte identical reconstruction.
+- **Two lossless coder wins** (identical PSNR/MAE/SSIM/max): the block header
+  (mean + value range) is entropy-coded into the range stream rather than kept
+  as a raw 18-byte struct, and the range-coder contexts are seeded with static
+  priors trained on this scroll data instead of starting at 50/50. Together they
+  add roughly +5–15 % ratio, most at high quality where the header used to
+  dominate and the per-block contexts never had time to adapt.
 
 ### Cross-dtype sanity
 
@@ -151,10 +153,10 @@ above (u8, one 16³ block = 4096 voxels = 4 KB raw):
   q      encode              decode
          MB/s   ns/block      MB/s   ns/block
   ----------------------------------------------
-  q1     110     37400        111     37000
-  q4     168     24400        236     17400
-  q16    219     18700        426      9600
-  q64    245     16700        647      6300
+  q1     117     35000        121     33800
+  q4     179     22900        252     16300
+  q16    229     17900        457      9000
+  q64    256     16000        657      6200
 ```
 
 Throughput rises with `quality` because there are fewer significant coefficients
@@ -162,6 +164,8 @@ to range-code. Decode outruns encode at high quality once the sparse-coefficient
 path dominates. The per-coefficient step table and the frequency scan order are
 pure functions of the geometry, so they are computed once and cached rather than
 rebuilt per block — that alone is ~1.8× encode and up to ~3× decode at high q.
+Seeding the coder contexts with trained priors also nudges throughput up (fewer
+bits coded), so it helps ratio and speed at once.
 
 Because the codec is **thread-free and every block is independent**, it scales
 out trivially — the same M4 across its 10 cores (OpenMP, one block per work
