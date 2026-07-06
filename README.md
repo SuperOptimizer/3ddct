@@ -93,20 +93,20 @@ with `tau = 2·quality`:
 ```
 setting        ratio   b/vox   PSNR    MAE    SSIM     err p90/p95/p99/max
 ------------------------------------------------------------------------
-q1              6.1x   0.168  50.14  0.515  0.9997     1 /  2 /  2 /  7
-q1  tau=2       5.2x   0.196  50.67  0.483  0.9997     1 /  1 /  2 /  2
-q2              9.7x   0.106  47.00  0.814  0.9994     2 /  2 /  3 /  9
-q2  tau=4       9.2x   0.111  47.11  0.806  0.9994     2 /  2 /  3 /  4
-q4             15.3x   0.066  43.93  1.208  0.9988     3 /  3 /  4 / 14
-q4  tau=8      15.2x   0.067  43.95  1.207  0.9988     3 /  3 /  4 /  8
-q8             24.3x   0.042  40.84  1.746  0.9975     4 /  5 /  7 / 22
-q8  tau=16     24.2x   0.042  40.84  1.746  0.9975     4 /  5 /  7 / 16
-q16            38.6x   0.026  37.77  2.486  0.9948     5 /  7 / 10 / 35
-q16 tau=32     38.6x   0.026  37.77  2.486  0.9948     5 /  7 / 10 / 30
-q32            59.8x   0.017  34.81  3.478  0.9894     7 / 10 / 14 / 50
-q32 tau=64     59.8x   0.017  34.81  3.478  0.9894     7 / 10 / 14 / 50
-q64            87.4x   0.011  32.01  4.763  0.9793    10 / 14 / 20 / 76
-q64 tau=128    87.4x   0.011  32.01  4.763  0.9793    10 / 14 / 20 / 76
+q1              6.2x   0.167  50.14  0.515  0.9997     1 /  2 /  2 /  7
+q1  tau=2       5.2x   0.195  50.67  0.483  0.9997     1 /  1 /  2 /  2
+q2              9.8x   0.105  47.00  0.814  0.9994     2 /  2 /  3 /  9
+q2  tau=4       9.3x   0.110  47.11  0.806  0.9994     2 /  2 /  3 /  4
+q4             15.6x   0.065  43.93  1.208  0.9988     3 /  3 /  4 / 14
+q4  tau=8      15.5x   0.066  43.95  1.207  0.9988     3 /  3 /  4 /  8
+q8             25.1x   0.040  40.84  1.746  0.9975     4 /  5 /  7 / 22
+q8  tau=16     25.0x   0.040  40.84  1.746  0.9975     4 /  5 /  7 / 16
+q16            40.7x   0.025  37.77  2.486  0.9948     5 /  7 / 10 / 35
+q16 tau=32     40.6x   0.025  37.77  2.486  0.9948     5 /  7 / 10 / 30
+q32            65.0x   0.015  34.81  3.478  0.9894     7 / 10 / 14 / 50
+q32 tau=64     65.0x   0.015  34.81  3.478  0.9894     7 / 10 / 14 / 50
+q64            99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
+q64 tau=128    99.0x   0.010  32.00  4.763  0.9793    10 / 14 / 20 / 76
 ```
 
 - **ratio** = raw ÷ compressed; **b/vox** = bytes per voxel (raw is 1.0).
@@ -117,8 +117,8 @@ q64 tau=128    87.4x   0.011  32.01  4.763  0.9793    10 / 14 / 20 / 76
 ### Reading the numbers
 
 - **q1 ≈ visually lossless:** ~6× smaller, 50 dB, SSIM 0.9997, 99 % of voxels
-  off by ≤2. **q8 ≈ 24×** still holds 41 dB / 0.997 SSIM.
-- **Graceful high end:** q64 reaches ~87× at 32 dB and SSIM still 0.98 — a
+  off by ≤2. **q8 ≈ 25×** still holds 41 dB / 0.997 SSIM.
+- **Graceful high end:** q64 reaches ~99× at 32 dB and SSIM still 0.98 — a
   usable preview at ~0.01 bytes/voxel.
 - **`tau` does what it says.** The `max` error column collapses to exactly `tau`
   wherever the bound bites (`q1 tau=2` → max 2, `q2 tau=4` → max 4, …). Because
@@ -126,13 +126,20 @@ q64 tau=128    87.4x   0.011  32.01  4.763  0.9793    10 / 14 / 20 / 76
   the bound is nearly free: `q2 tau=4` costs ~5 % over plain `q2`, and by q≥16
   the natural error is already under `2q`, so `tau=2q` is a no-op (identical
   rows).
+- The header (block mean + value range) is entropy-coded into the same range
+  stream rather than stored as a raw 18-byte struct, which is why the ratio win
+  grows with quality (the header used to dominate small high-q blobs) — up to
+  ~+13 % at q64, at byte-for-byte identical reconstruction.
 
 ### Cross-dtype sanity
 
 Auto-normalization means the same `quality` gives the same *relative* fidelity
 regardless of dtype. Synthetic blocks at `q=1.0`, RMSE as a fraction of the
-value range: u8 ≈ 0.36 %, u16 ≈ 0.4 %, u32 ≈ 0.4 %, f32 ≈ 0.4 %. Absolute `tau`
-is honored exactly for every type (e.g. f32 `tau=0.00998` → max error 0.00998).
+value range lands around a few tenths of a percent for every type. Absolute
+`tau` is honored per-voxel for all dtypes: the correction quantum shrinks with
+tau, so e.g. a u16 block spanning ~8500 at `tau=1` reconstructs within ±1, and
+f32 at `tau=0.001` within 0.001 (see **Notes & caveats** for the u32/s32 and
+f32-precision limits).
 
 ## Performance
 
@@ -144,20 +151,22 @@ above (u8, one 16³ block = 4096 voxels = 4 KB raw):
   q      encode              decode
          MB/s   ns/block      MB/s   ns/block
   ----------------------------------------------
-  q1     104     39300        87     46900
-  q4     146     28100       139     29400
-  q16    175     23400       181     22700
-  q64    197     20800       213     19200
+  q1     110     37400        111     37000
+  q4     168     24400        236     17400
+  q16    219     18700        426      9600
+  q64    245     16700        647      6300
 ```
 
 Throughput rises with `quality` because there are fewer significant coefficients
-to range-code. MB/s is of raw voxel data; a block is ~20–47 µs each way.
+to range-code. Decode outruns encode at high quality once the sparse-coefficient
+path dominates. The per-coefficient step table and the frequency scan order are
+pure functions of the geometry, so they are computed once and cached rather than
+rebuilt per block — that alone is ~1.8× encode and up to ~3× decode at high q.
 
 Because the codec is **thread-free and every block is independent**, it scales
 out trivially — the same M4 across its 10 cores (OpenMP, one block per work
-item) hits **~624 MB/s encode at q1 and ~1.04 GB/s at q16**, ~6× the
-single-thread rate. There are no locks or shared writable state to contend on;
-the only shared read is the static cosine table.
+item) exceeds **1 GB/s**. There are no locks or shared writable state to contend
+on; the only shared reads are the static cosine/step/scan tables.
 
 ## Notes & caveats
 
@@ -167,8 +176,25 @@ the only shared read is the static cosine table.
   exactly (and the `tau` bound holds), but a decoder built differently may drift
   by a small delta. If you need a hard cross-machine bound, compile both sides
   the same way (and pin `-ffp-contract=off`).
+- **u32 / s32 magnitudes above 2²⁴ lose their low bits.** The pipeline is
+  float32 (24-bit mantissa), so a value like 3·10⁹ can't be represented exactly
+  *before* any lossy step — a bare `(uint32_t)(float)v` round-trip already
+  rounds it. u32/s32 are fully faithful up to ~16.7M in magnitude (which covers
+  the usual voxel/label ranges); beyond that, expect an error on the order of
+  `magnitude · 2⁻²⁴` regardless of `quality`/`tau`. u8/u16/s8/s16/f32 are
+  unaffected. If you need exact large 32-bit integers, offset/scale them into
+  range before encoding.
+- **`tau` is met to the correction quantum.** The correction pass rounds
+  residuals to a quantum that shrinks with `tau`, so the honored per-voxel bound
+  is `tau` (not the older `max(tau, 0.5·vspan/255)`) for every dtype — verified
+  for u8/u16/u32/f32. For f32, "met" is still subject to the same-build float
+  caveat above.
 - **Fixed 16³ block.** The transform, scan order, and contexts are specialized to
   `DCT3D_N = 16`. Tile larger volumes yourself.
+- **Non-finite f32 input is sanitized, not preserved.** A NaN/Inf voxel is
+  replaced with the block's finite minimum at encode (so every *finite* voxel
+  still round-trips and the blob is always decodable); the non-finite value
+  itself is not recovered.
 - **Robust to corruption.** Truncated or bit-flipped blobs are rejected or safely
   bounded — fuzzed with truncations and random bit flips, never crashes.
 

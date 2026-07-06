@@ -119,13 +119,22 @@ static void dct3_inv(const float *restrict coef, float *restrict blk,
 //   level   = sign(c) * floor(|c|/step + (1 - DZ_FRAC))  for |c| >= dz else 0
 //   recon   = sign(l) * step * (|l| - 1 + DZ_FRAC + 0.40)
 // ============================================================================
-static inline float hf_weight(int cz, int cy, int cx) {
-    return powf(1.0f + (float)(cz + cy + cx), HF_EXP);
+// The per-coefficient step is qstep * (1 + L1freq)^HF_EXP, and the weight
+// depends only on L1freq = cz+cy+cx in [0, 3*(N-1)] (46 distinct values for
+// N=16). Precompute those 46 powf results once (idempotent write, same
+// lock-free pattern as the cosine table) so step_build is a scalar multiply
+// per coefficient instead of a powf. Bit-identical to the old triple-powf loop.
+static float g_hfw[3 * (N - 1) + 1];
+static int   g_hfw_ready = 0;
+static void hfw_init(void) {
+    if (g_hfw_ready) return;
+    for (int f = 0; f <= 3 * (N - 1); ++f) g_hfw[f] = powf(1.0f + (float)f, HF_EXP);
+    g_hfw_ready = 1;
 }
 static void step_build(float qstep, float step_tab[N3]) {
     for (int cz = 0; cz < N; ++cz) for (int cy = 0; cy < N; ++cy) for (int cx = 0; cx < N; ++cx) {
         int i = (cz * N + cy) * N + cx;
-        step_tab[i] = qstep * hf_weight(cz, cy, cx);
+        step_tab[i] = qstep * g_hfw[cz + cy + cx];
     }
 }
 static inline float quant_one(float c, float step) {
@@ -224,6 +233,30 @@ static rc_u32 dec_eg(rc_dec *d) {
     return ((1u << nb) | dec_bypass_n(d, (int)nb)) - 1;
 }
 
+// Signed Exp-Golomb (zig-zag mapped), for small signed integers.
+static void enc_seg(rc_enc *e, long v) {
+    rc_u32 z = v < 0 ? (rc_u32)(-2 * v - 1) : (rc_u32)(2 * v);
+    enc_eg(e, z);
+}
+static long dec_seg(rc_dec *d) {
+    rc_u32 z = dec_eg(d);
+    return (z & 1) ? -(long)((z + 1) >> 1) : (long)(z >> 1);
+}
+
+// Store a float header field compactly: one flag bit, then either an integer
+// (signed Exp-Golomb) when the value is an exact integer in +-2^24 (the common
+// case for integer-dtype vmin/vspan, and cheap), or raw 32 bits otherwise
+// (f32 data). Lossless in both branches.
+static void enc_fval(rc_enc *e, float f) {
+    float r = truncf(f);
+    if (r == f && fabsf(f) < 16777216.0f) { enc_bypass(e, 0); enc_seg(e, (long)r); }
+    else { enc_bypass(e, 1); uint32_t b; memcpy(&b, &f, 4); enc_bypass_n(e, b, 32); }
+}
+static float dec_fval(rc_dec *d) {
+    if (!dec_bypass(d)) return (float)dec_seg(d);
+    uint32_t b = dec_bypass_n(d, 32); float f; memcpy(&f, &b, 4); return f;
+}
+
 // ============================================================================
 // Coefficient context coder. Ascending-frequency scan with an EOB, per-band
 // significance contexts conditioned on recent significance density, and an
@@ -261,10 +294,14 @@ static rc_u32 dec_magnitude(rc_dec *d, coef_ctx *ac) {
     return v + x + 1;
 }
 
-// Ascending-L1-frequency scan order over the 16^3 coefficient cube. Stable and
-// deterministic, computed identically by encoder and decoder into a
-// caller-provided buffer via counting sort (allocation-free, no shared state).
-static void build_scan(uint16_t scan[N3]) {
+// Ascending-L1-frequency scan order over the 16^3 coefficient cube. It is a
+// pure function of the fixed geometry (same table every call), so it is built
+// once by counting sort into a shared table rather than rebuilt per block.
+// Idempotent write, same lock-free pattern as the cosine table.
+static uint16_t g_scan[N3];
+static int      g_scan_ready = 0;
+static void scan_init(void) {
+    if (g_scan_ready) return;
     enum { FMAX = 3 * (N - 1) };   // max L1 frequency = 45
     int hist[FMAX + 2];
     for (int i = 0; i < FMAX + 2; ++i) hist[i] = 0;
@@ -275,8 +312,9 @@ static void build_scan(uint16_t scan[N3]) {
     for (int i = 1; i < FMAX + 2; ++i) hist[i] += hist[i - 1];
     for (int idx = 0; idx < N3; ++idx) {
         int cz = idx / (N * N), cy = (idx / N) % N, cx = idx % N;
-        scan[hist[cz + cy + cx]++] = (uint16_t)idx;
+        g_scan[hist[cz + cy + cx]++] = (uint16_t)idx;
     }
+    g_scan_ready = 1;
 }
 static inline int band_of(rc_u32 idx) {
     rc_u32 cz = idx / (N * N), cy = (idx / N) % N, cx = idx % N, freq = cz + cy + cx;
@@ -333,33 +371,40 @@ static void dec_coefs(rc_dec *d, float *lvl, const uint16_t *scan) {
 }
 
 // ============================================================================
-// Little-endian scalar (de)serialization for the fixed blob header.
+// Raw preamble (de)serialization. Everything else rides in the range stream.
 // ============================================================================
-static void put_u8 (uint8_t **p, uint32_t v) { *(*p)++ = (uint8_t)v; }
-static void put_u32(uint8_t **p, uint32_t v) { (*p)[0]=(uint8_t)v; (*p)[1]=(uint8_t)(v>>8); (*p)[2]=(uint8_t)(v>>16); (*p)[3]=(uint8_t)(v>>24); *p += 4; }
-static void put_f32(uint8_t **p, float f)    { uint32_t v; memcpy(&v, &f, 4); put_u32(p, v); }
-static uint32_t get_u8 (const uint8_t **p) { return *(*p)++; }
-static uint32_t get_u32(const uint8_t **p) { uint32_t v = (uint32_t)(*p)[0]|((uint32_t)(*p)[1]<<8)|((uint32_t)(*p)[2]<<16)|((uint32_t)(*p)[3]<<24); *p += 4; return v; }
-static float    get_f32(const uint8_t **p) { uint32_t v = get_u32(p); float f; memcpy(&f, &v, 4); return f; }
+static void     put_u8(uint8_t **p, uint32_t v)  { *(*p)++ = (uint8_t)v; }
+static uint32_t get_u8(const uint8_t **p)         { return *(*p)++; }
 
 // ============================================================================
 // dtype ids and blob framing.
 //
-// Blob layout (all multi-byte fields little-endian):
-//   [u8 MAGIC][u8 dtype][f32 vmin][f32 vspan][f32 quality][f32 dc]
-//   [range-coded stream: has-corr flag | coefficient levels | corrections]
+// Blob layout: a 2-byte raw preamble [u8 MAGIC][u8 dtype] (so a wrong-typed or
+// non-dct3d blob is rejected before touching the coder), then ONE range-coded
+// stream carrying everything else:
+//   enc_fval(vmin) enc_fval(vspan) [f32 qstep raw] seg(dcq)
+//   | has-corr flag | coefficient levels | corrections
 //
 // vmin/vspan describe the block's raw value range; the working domain is
 // (value - vmin)/vspan * 255 so the fixed quality calibration behaves uniformly
-// across dtypes. quality is stored so the decoder rebuilds the same step table.
-// dc is the normalized block mean. Corrections carry exact f32 residuals.
+// across dtypes. vmin/vspan are coded as integers when exact (the integer-dtype
+// common case), else raw. qstep is raw f32 (must reproduce the step table bit-
+// for-bit). dcq is the block mean fine-quantized to 1/DC_Q units, coded as a
+// small signed integer. This replaces the old fixed 18-byte raw header, whose
+// blob share reached ~35% at high quality.
 // ============================================================================
 enum { DT_U8=1, DT_U16=2, DT_U32=3, DT_S8=4, DT_S16=5, DT_S32=6, DT_F32=7 };
 #define MAGIC 0xD3u
-#define HDR_BYTES (1 + 1 + 4 + 4 + 4 + 4)
+#define HDR_BYTES 2            // raw preamble: MAGIC + dtype
+#define DC_Q 16                // dc fine-quantization: 1/16 normalized unit
 
+// Clamp to [lo,hi], mapping NaN to lo. NaN-safety matters on the decode path:
+// a corrupt blob can decode vmin/vspan to values that make a voxel non-finite,
+// and casting a non-finite (or out-of-range) float to an integer dtype is UB —
+// this clamp is what makes the store well-defined for any input.
 static inline float clampf(float v, float lo, float hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
+    if (!(v >= lo)) return lo;      // false when v < lo OR v is NaN
+    return v > hi ? hi : v;
 }
 
 // Shared float-domain encode. `blk_in` holds the block loaded to float; vmin
@@ -367,17 +412,24 @@ static inline float clampf(float v, float lo, float hi) {
 static size_t encode_float(const float *blk_in, float vmin, float vspan,
                            int dtype, float quality, float max_error, float tau,
                            uint8_t *out) {
-    dct_init();
+    dct_init(); hfw_init(); scan_init();
 
     const float scale = 255.0f / vspan;              // raw -> normalized(0..255)
     float qstep = quality; if (!(qstep > 0.0f)) qstep = 1.0f;
 
-    // normalize, take the mean, center.
+    // normalize, take the mean, center. The mean (dc) is fine-quantized to
+    // 1/DC_Q normalized units and coded as a small integer instead of a raw
+    // f32 (its own slot in the transform, coef[0], is forced to ~0 by centering
+    // and would otherwise waste 32 bits). Encoder and decoder both use the
+    // quantized dcq so the split is exact; the sub-1/DC_Q remainder is absorbed
+    // by coef[0] and coded losslessly with everything else.
     float norm[N3], blk[N3];
     float sum = 0.0f;
     for (int i = 0; i < N3; ++i) { float w = (blk_in[i] - vmin) * scale; norm[i] = w; sum += w; }
     float dc = sum / (float)N3;
-    for (int i = 0; i < N3; ++i) blk[i] = norm[i] - dc;
+    long  dcq_i = (long)lroundf(dc * (float)DC_Q);
+    float dcq = (float)dcq_i / (float)DC_Q;
+    for (int i = 0; i < N3; ++i) blk[i] = norm[i] - dcq;
 
     float a[N3], b[N3], coef[N3];
     dct3_fwd(blk, coef, a, b);
@@ -393,13 +445,21 @@ static size_t encode_float(const float *blk_in, float vmin, float vspan,
     if (max_error > 0.0f) tnorm = max_error * 255.0f;
     if (tau > 0.0f) { float t2 = tau * scale; tnorm = (tnorm == 0.0f) ? t2 : (t2 < tnorm ? t2 : tnorm); }
 
+    // Correction quantum (normalized units). Corrections are stored as integer
+    // multiples of cq, so a corrected voxel lands within 0.5*cq of exact. To
+    // honor tau we need 0.5*cq*(vspan/255) <= tau, i.e. cq <= 2*tnorm; we use
+    // cq = min(1, tnorm) which satisfies that with margin and stays coarse (1
+    // normalized unit) whenever the request is looser than one unit — so u8 and
+    // other narrow-range data keep the cheap ~integer deltas, while a tight tau
+    // on a wide-range dtype (u16/u32/f32) shrinks the quantum enough to meet it.
+    float cq = tnorm < 1.0f ? tnorm : 1.0f;
     uint16_t cpos[N3]; float cdel[N3]; int ncorr = 0;
     if (tnorm > 0.0f) {
         float rc[N3], rb[N3];
         for (int i = 0; i < N3; ++i) rc[i] = deq_one(lvl[i], step[i]);
         dct3_inv(rc, rb, a, b);
         for (int i = 0; i < N3; ++i) {
-            float err = norm[i] - (rb[i] + dc);
+            float err = norm[i] - (rb[i] + dcq);
             if (err > tnorm || err < -tnorm) { cpos[ncorr] = (uint16_t)i; cdel[ncorr] = err; ncorr++; }
         }
     }
@@ -407,32 +467,33 @@ static size_t encode_float(const float *blk_in, float vmin, float vspan,
     uint8_t *p = out;
     put_u8(&p, MAGIC);
     put_u8(&p, (uint32_t)dtype);
-    put_f32(&p, vmin);
-    put_f32(&p, vspan);
-    put_f32(&p, qstep);
-    put_f32(&p, dc);
 
     rc_enc e; enc_init(&e, p, DCT3D_MAX_BYTES - HDR_BYTES);
+    enc_fval(&e, vmin);
+    enc_fval(&e, vspan);
+    { uint32_t qb; memcpy(&qb, &qstep, 4); enc_bypass_n(&e, qb, 32); }
+    enc_seg(&e, dcq_i);
     ctx_t cflag; ctx_init(&cflag);
     enc_bit(&e, &cflag, ncorr > 0);
 
-    uint16_t scan[N3]; build_scan(scan);
-    enc_coefs(&e, lvl, scan);
+    enc_coefs(&e, lvl, g_scan);
 
     if (ncorr > 0) {
-        // Corrections are integer deltas in the normalized (0..255) domain,
-        // coded as gap (Exp-Golomb) + sign + Exp-Golomb(|delta|). Storing the
-        // rounded normalized residual (a small integer) rather than a raw f32
-        // keeps the pass cheap: for u8 data a delta is a handful of bits, not
-        // 40. This leaves each corrected voxel within 0.5 normalized units of
-        // exact, so the honored bound is max(tnorm, 0.5 * vspan/255).
+        // Correction stream: [eg count][f32 cq][ {eg gap, sign, eg(|delta|-1)} ]*.
+        // delta is err/cq rounded to the nearest nonzero integer, so the applied
+        // correction is delta*cq and the residual is < 0.5*cq normalized (=>
+        // < 0.5*cq*vspan/255 raw), meeting tau by construction. cq rides in the
+        // stream (corrections-only, 32 bypass bits) since the decoder does not
+        // know tau. For narrow-range data cq==1 and deltas are small integers.
         enc_eg(&e, (rc_u32)(ncorr - 1));
+        uint32_t cqb; memcpy(&cqb, &cq, 4); enc_bypass_n(&e, cqb, 32);
         rc_u32 prev = 0;
         for (int c = 0; c < ncorr; ++c) {
             enc_eg(&e, (rc_u32)cpos[c] - prev); prev = cpos[c];
-            long di = (long)lroundf(cdel[c]);
+            long di = (long)lroundf(cdel[c] / cq);
+            if (di == 0) di = cdel[c] < 0.0f ? -1 : 1;   // corrected => nonzero
             enc_bypass(&e, di < 0 ? 1 : 0);
-            enc_eg(&e, (rc_u32)(di < 0 ? -di : di));
+            enc_eg(&e, (rc_u32)((di < 0 ? -di : di) - 1));
         }
     }
     enc_flush(&e);
@@ -446,22 +507,23 @@ static int decode_float(const uint8_t *blob, size_t len, int want_dtype, float *
     const uint8_t *p = blob;
     if (get_u8(&p) != MAGIC) return 0;
     if ((int)get_u8(&p) != want_dtype) return 0;
-    float vmin  = get_f32(&p);
-    float vspan = get_f32(&p);
-    float qstep = get_f32(&p);
-    float dc    = get_f32(&p);
+
+    dct_init(); hfw_init(); scan_init();
+
+    rc_dec d; dec_init(&d, p, len - HDR_BYTES);
+    float vmin  = dec_fval(&d);
+    float vspan = dec_fval(&d);
+    uint32_t qb = dec_bypass_n(&d, 32); float qstep; memcpy(&qstep, &qb, 4);
+    float dc    = (float)dec_seg(&d) / (float)DC_Q;
     if (!(vspan > 0.0f) || !(qstep > 0.0f) ||
         !isfinite(vmin) || !isfinite(dc)) return 0;
 
-    dct_init();
     float step[N3]; step_build(qstep, step);
 
-    rc_dec d; dec_init(&d, p, len - HDR_BYTES);
     ctx_t cflag; ctx_init(&cflag);
     int has_corr = dec_bit(&d, &cflag);
 
-    uint16_t scan[N3]; build_scan(scan);
-    float lvl[N3]; dec_coefs(&d, lvl, scan);
+    float lvl[N3]; dec_coefs(&d, lvl, g_scan);
 
     float coef[N3], a[N3], b[N3], rb[N3];
     for (int i = 0; i < N3; ++i) coef[i] = deq_one(lvl[i], step[i]);
@@ -475,12 +537,15 @@ static int decode_float(const uint8_t *blob, size_t len, int want_dtype, float *
         // both so decoding can never read or write out of bounds.
         rc_u32 ncorr = dec_eg(&d) + 1, pos = 0;
         if (ncorr > (rc_u32)N3) ncorr = N3;
+        uint32_t cqb = dec_bypass_n(&d, 32); float cq; memcpy(&cq, &cqb, 4);
+        if (!(cq > 0.0f) || !isfinite(cq)) cq = 1.0f;   // corrupt guard
         for (rc_u32 c = 0; c < ncorr; ++c) {
             pos += dec_eg(&d);
             int neg = dec_bypass(&d);
-            rc_u32 mag = dec_eg(&d);
+            rc_u32 mag = dec_eg(&d) + 1;
             if (pos >= (rc_u32)N3) break;
-            norm[pos] += neg ? -(float)mag : (float)mag;
+            float delta = (float)mag * cq;
+            norm[pos] += neg ? -delta : delta;
         }
     }
 
@@ -499,10 +564,21 @@ static int decode_float(const uint8_t *blob, size_t len, int want_dtype, float *
 #define ENC_BODY(T, DT, ROUND, LO, HI)                                        \
     do {                                                                      \
         float fb[N3];                                                         \
-        float vmin = (float)chunk[0], vmax = (float)chunk[0];                 \
+        /* min/max over FINITE voxels only. Integer dtypes are always finite  \
+         * (the isfinite test folds away); for f32 this keeps a stray NaN/Inf \
+         * from poisoning the header and losing the whole block. Non-finite   \
+         * voxels are substituted with the finite min so every finite voxel   \
+         * still round-trips and the blob is always decodable. */             \
+        float vmin = 0, vmax = 0; int seen = 0;                               \
         for (int i = 0; i < N3; ++i) {                                        \
-            float v = (float)chunk[i]; fb[i] = v;                             \
-            if (v < vmin) vmin = v; if (v > vmax) vmax = v;                   \
+            float v = (float)chunk[i];                                        \
+            if (!isfinite(v)) continue;                                       \
+            if (!seen) { vmin = vmax = v; seen = 1; }                         \
+            else { if (v < vmin) vmin = v; if (v > vmax) vmax = v; }          \
+        }                                                                     \
+        if (!seen) { vmin = vmax = 0; }   /* all non-finite: encode as flat */\
+        for (int i = 0; i < N3; ++i) {                                        \
+            float v = (float)chunk[i]; fb[i] = isfinite(v) ? v : vmin;        \
         }                                                                     \
         float vspan = vmax - vmin; if (!(vspan > 0.0f)) vspan = 1.0f;         \
         return encode_float(fb, vmin, vspan, (DT), quality, max_error, tau,   \

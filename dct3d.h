@@ -60,16 +60,22 @@ extern "C" {
 //     max_error [0,1) optional *relative* error bound: caps per-voxel error at
 //                    max_error * chunk_value_range. 0 disables.
 //     tau       >= 0  optional *absolute* error bound in raw input units (e.g.
-//                    tau=2 => reconstructed values within +-2 of the original).
-//                    0 disables.
+//                    tau=2 => reconstructed values within +-2 of the original,
+//                    honored for every dtype). 0 disables.
 //   If both max_error and tau are set, the tighter (smaller) bound wins. Either
-//   one enables a sparse exact-residual correction pass; both off = pure DCT.
+//   one enables a sparse correction pass; both off = pure DCT.
 // decode: reconstructs DCT3D_N3 voxels into `chunk` from a `len`-byte blob.
 //   Returns 1 on success, 0 on a malformed/truncated blob. Robust to corrupt
 //   input: it never reads or writes out of bounds.
 //
 // The blob records its own dtype; decoding with the wrong-typed function
 // returns 0 rather than producing garbage.
+//
+// Caveats (see README for detail): the internal pipeline is float32, so u32/s32
+// values above 2^24 in magnitude lose low bits before any lossy step (u8/u16/
+// s8/s16 and small 32-bit values are unaffected); non-finite f32 voxels are
+// sanitized to the block's finite min at encode; and f32 tau-honoring is subject
+// to the same-build float-reproducibility caveat.
 #define DCT3D_DECL(T, name)                                                    \
     size_t dct3d_encode_##name(const T *chunk, float quality, float max_error, \
                                float tau, uint8_t *out);                       \

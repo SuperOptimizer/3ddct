@@ -100,6 +100,54 @@ static void test_corrupt(void){
     printf("corrupt/truncate  : survived (no crash)\n");
 }
 
+// --- regression tests for the three correctness findings from code review ----
+
+// tau on wide-range dtypes must be honored per-voxel (was floored at ~vspan/510).
+// NOTE: the f32 case needs real (non-fast-math) float; build this file without
+// -ffast-math to exercise it meaningfully.
+static void test_tau_wide(void){
+    uint8_t blob[DCT3D_MAX_BYTES];
+    uint16_t u[DCT3D_N3], ub[DCT3D_N3]; uint32_t s=7;
+    for(int i=0;i<DCT3D_N3;++i) u[i]=(uint16_t)(30000 + (i%16)*500 + rng(&s)%1000);
+    for(float tau=1; tau<=8; tau*=2){
+        size_t n=dct3d_encode_u16(u,8.0f,0,tau,blob); dct3d_decode_u16(blob,n,ub);
+        int mx=0; for(int i=0;i<DCT3D_N3;++i){int e=abs((int)u[i]-ub[i]); if(e>mx)mx=e;}
+        CHECK(mx<=(int)tau, "u16 wide tau=%.0f maxerr=%d", tau, mx);
+    }
+    float f[DCT3D_N3], fb[DCT3D_N3];
+    for(int i=0;i<DCT3D_N3;++i) f[i]=100.0f + 0.5f*(i%16) + 0.01f*(rng(&s)%50);
+    for(float tau=0.001f; tau<=0.1f; tau*=10){
+        size_t n=dct3d_encode_f32(f,8.0f,0,tau,blob); dct3d_decode_f32(blob,n,fb);
+        float mx=0; for(int i=0;i<DCT3D_N3;++i){float e=fabsf(f[i]-fb[i]); if(e>mx)mx=e;}
+        CHECK(mx<=tau*1.001f, "f32 wide tau=%.3f maxerr=%.5f", tau, mx);
+    }
+}
+
+// NaN/Inf f32 input must yield a decodable blob preserving finite voxels.
+static void test_nonfinite_f32(void){
+    uint8_t blob[DCT3D_MAX_BYTES];
+    float f[DCT3D_N3], fb[DCT3D_N3]; uint32_t s=3;
+    for(int i=0;i<DCT3D_N3;++i) f[i]=10.0f + 0.1f*(rng(&s)%40);
+    f[100]=NAN; f[2000]=INFINITY; f[3000]=-INFINITY;
+    for(int i=0;i<DCT3D_N3;++i) fb[i]=-999.0f;
+    size_t n=dct3d_encode_f32(f,2.0f,0,0.5f,blob);
+    CHECK(dct3d_decode_f32(blob,n,fb), "f32 NaN/Inf decodable");
+    int bad=0; for(int i=0;i<DCT3D_N3;++i){ if(i==100||i==2000||i==3000) continue;
+        if(fabsf(f[i]-fb[i])>0.51f) bad++; }
+    CHECK(bad==0, "f32 NaN/Inf finite voxels preserved (%d bad)", bad);
+    CHECK(isfinite(fb[100]), "f32 NaN voxel -> finite");
+}
+
+// small-magnitude u32 must round-trip losslessly within tau.
+static void test_u32_small(void){
+    uint8_t blob[DCT3D_MAX_BYTES];
+    uint32_t u[DCT3D_N3], ub[DCT3D_N3]; uint32_t s=9;
+    for(int i=0;i<DCT3D_N3;++i) u[i]=100 + (i%16)*3 + rng(&s)%20;
+    size_t n=dct3d_encode_u32(u,1.0f,0,1.0f,blob); dct3d_decode_u32(blob,n,ub);
+    int mx=0; for(int i=0;i<DCT3D_N3;++i){int e=abs((int)u[i]-(int)ub[i]); if(e>mx)mx=e;}
+    CHECK(mx<=1, "u32 small-magnitude tau=1 maxerr=%d", mx);
+}
+
 int main(void){
     test_u8(); test_u16(); test_u32();
     test_s8(); test_s16(); test_s32();
@@ -107,6 +155,9 @@ int main(void){
     test_reject_wrong_dtype();
     test_flat_block();
     test_corrupt();
+    test_tau_wide();
+    test_nonfinite_f32();
+    test_u32_small();
     printf(fails? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", fails);
     return fails?1:0;
 }
