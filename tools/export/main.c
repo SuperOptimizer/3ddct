@@ -151,7 +151,7 @@ static void *download_main(void *arg) {
 
         if (p->resume && !p->dry_run) {
             char remote[1536];
-            snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/%lld/%lld/%lld",
+            snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/c/%lld/%lld/%lld",
                      p->remote_root, p->scroll, p->vol, p->lvl.level,
                      (long long)sc.sz, (long long)sc.sy, (long long)sc.sx);
             if (sftp_size(&p->sftp, remote) >= 0) {
@@ -226,7 +226,7 @@ static void *upload_main(void *arg) {
     while (bq_pop(&p->shard_q, &item)) {
         shard_item *si = (shard_item *)item;
         char remote[1536];
-        snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/%lld/%lld/%lld",
+        snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/c/%lld/%lld/%lld",
                  p->remote_root, p->scroll, p->vol, p->lvl.level,
                  (long long)si->sc.sz, (long long)si->sc.sy, (long long)si->sc.sx);
         int ok = p->dry_run ? 1 : (sftp_upload(&p->sftp, remote, si->shard, si->len) == 0);
