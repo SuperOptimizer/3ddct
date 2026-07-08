@@ -42,6 +42,43 @@ def _c_std_flag() -> str | None:
             break
     return None
 
+
+def _needs_libmvec() -> bool:
+    """True if this compiler needs an explicit ``-lmvec`` under ``-ffast-math``.
+
+    gcc on glibc auto-vectorizes the codec's ``powf`` loop into a libmvec call
+    (``_ZGVbN4vv_powf``); its own driver adds ``-lmvec``, but the bare link line
+    setuptools/cffi use to build the extension does not, so the .so fails to
+    load with an undefined symbol. clang emits a plain ``powf`` and needs
+    nothing. Probe functionally — build a shared object that calls ``powf`` in a
+    vectorizable loop under the codec's flags, WITHOUT the compiler driver's
+    implicit libs (``-nostdlib`` on the link) and see whether adding ``-lmvec``
+    is what makes it resolve. No compiler-name guessing.
+    """
+    cc = os.environ.get("CC", "cc")
+    src = (
+        "#include <math.h>\n"
+        "float s[64];\n"
+        "void f(float b){ for(int i=0;i<64;++i) s[i]=powf(b+(float)i,0.65f); }\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cf = os.path.join(d, "t.c")
+            with open(cf, "w") as fh:
+                fh.write(src)
+            obj = os.path.join(d, "t.o")
+            comp = subprocess.run(
+                [cc, "-O3", "-ffast-math", "-fPIC", "-c", cf, "-o", obj],
+                capture_output=True,
+            )
+            if comp.returncode != 0:
+                return False
+            # Does the object reference the libmvec vector-powf symbol?
+            nm = subprocess.run(["nm", "-u", obj], capture_output=True, text=True)
+            return "_ZGV" in nm.stdout and "powf" in nm.stdout
+    except OSError:
+        return False
+
 # This builder lives at the dct3d repo root, alongside dct3d.c / dct3d.h. The
 # extension source is referenced by a REPO-RELATIVE path ("dct3d.c") on purpose:
 # cffi/setuptools reject an absolute path in `sources`, and a relative one lands
@@ -94,6 +131,9 @@ ffibuilder.set_source(
         if os.name == "nt"
         else [f for f in (_c_std_flag(), "-O3", "-ffast-math") if f]
     ),
+    # gcc+glibc auto-vectorizes powf into a libmvec call the bare cffi link line
+    # doesn't resolve; add -lmvec only when the compiler actually emits it.
+    libraries=(["mvec"] if os.name != "nt" and _needs_libmvec() else []),
 )
 
 if __name__ == "__main__":
