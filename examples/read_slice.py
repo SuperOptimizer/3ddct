@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # Read one z-plane from a dct3d Zarr v3 export and save it as a PNG.
 # Fetch the shard once; zarr-python + the dct3d codec decode it.
-#   pip install zarr dct3d-zarr numpy pillow requests
+#
+# Setup (from a clone of this repo):
+#   pip install "zarr>=3" numpy cffi        # then, in the repo root:
+#   pip install .                           # builds+installs dct3d-zarr
+#   pip install pillow requests             # for this example
+#
+# Importing dct3d_zarr registers the "dct3d" codec with zarr (an entry point also
+# auto-registers it, so a stock zarr.open resolves it without this import).
 import io, json, os, tempfile, numpy as np, requests, zarr, dct3d_zarr  # noqa: F401
 from PIL import Image
 

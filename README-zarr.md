@@ -2,11 +2,25 @@
 
 `dct3d-zarr` exposes the [dct3d](./README.md) 16³ lossy volume codec as a
 **Zarr v3 codec** named `dct3d`. Install it and stock `zarr` reads and writes
-dct3d-compressed arrays with no further wiring:
+dct3d-compressed arrays with no further wiring.
+
+## Install
 
 ```sh
-pip install dct3d-zarr
+# From this repo (builds the cffi extension — needs a C compiler):
+pip install "zarr>=3" numpy cffi
+pip install .                    # run in the repo root
+
+# To READ a remote export over HTTP, also:
+pip install pillow requests "fsspec[http]"
 ```
+
+Prebuilt binary wheels are built by CI (`.github/workflows/wheels.yml`) for
+Linux/macOS/Windows; once published to PyPI a plain `pip install dct3d-zarr`
+will need no compiler. The codec registers with zarr through a `zarr.codecs`
+entry point on install, so **reading needs no explicit import** — a stock
+`zarr.open(...)` on a dct3d array resolves the codec automatically. See
+[`examples/read_slice.py`](examples/read_slice.py) for a minimal reader.
 
 ```python
 import numpy as np

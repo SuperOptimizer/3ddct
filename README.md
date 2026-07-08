@@ -202,6 +202,39 @@ on; the only shared reads are the static cosine/step/scan tables.
 - **Robust to corruption.** Truncated or bit-flipped blobs are rejected or safely
   bounded — fuzzed with truncations and random bit flips, never crashes.
 
+## Ecosystem
+
+This repo is the C codec plus everything needed to store scroll volumes with it
+and read them back through the standard tools:
+
+| Piece | What it is | Where |
+|-------|------------|-------|
+| **`dct3d.c` / `dct3d.h`** | the codec (this README) | repo root |
+| **`dct3d-zarr`** | a **Zarr v3 codec** wrapping dct3d — `pip install` it and stock zarr reads/writes dct3d arrays | [`dct3d_zarr/`](dct3d_zarr/) · [README-zarr.md](README-zarr.md) |
+| **`dct3d_export`** | multithreaded S3 → dct3d-Zarr-v3 → SFTP scroll exporter | [`tools/export/`](tools/export/) |
+| **`examples/read_slice.py`** | minimal reader: pull a slice through the zarr-python API | [`examples/`](examples/) |
+
+### Install the Python codec
+
+```sh
+pip install "zarr>=3" numpy cffi          # runtime deps
+pip install .                             # builds dct3d-zarr from this repo
+#   (also pulls in mvec/C toolchain to compile the cffi extension)
+```
+
+Prebuilt wheels are produced by CI (`.github/workflows/wheels.yml`); until they
+are published to PyPI, install from source as above. Once installed, the `dct3d`
+codec auto-registers with zarr via an entry point — a stock `zarr.open(...)` on a
+dct3d array just works, no import needed. Details + API in
+[README-zarr.md](README-zarr.md).
+
+### Read an exported volume
+
+```sh
+pip install "zarr>=3" dct3d-zarr numpy pillow requests "fsspec[http]"
+python examples/read_slice.py             # fetch a shard, decode a slice via zarr
+```
+
 ## License
 
 Derived from matter-compressor; see that project for upstream licensing.
