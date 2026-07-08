@@ -417,7 +417,7 @@ int main(int argc, char **argv) {
         // with no S3 traffic. Without --oracle-cache-dir we fall back to the
         // per-shard 64^3 S3 fetch (fine for small volumes).
         oracle_map omap = {0};
-        if (oracle_level >= 0 && a.oracle_cache_dir) {
+        if (oracle_level >= 0 && a.oracle_cache_dir && !a.count_only) {
             char opath[2048];
             snprintf(opath, sizeof(opath), "%s/%s_L%d.oracle",
                      a.oracle_cache_dir, a.vol, oracle_level);
@@ -460,25 +460,53 @@ int main(int argc, char **argv) {
         if (a.limit_shards >= 0 && (size_t)a.limit_shards < p.n_items)
             p.n_items = a.limit_shards;
 
-        // Count-only: classify every shard air/dense via the oracle (no fetch,
-        // no encode) for an accurate work estimate + ETA. Needs the oracle.
+        // Count-only: classify every shard air/dense for a work estimate + ETA.
+        // Uses a COARSER count level (L+5, i.e. L5 for an L0 export) — 8x smaller
+        // than the L4 export oracle (2.5-4 GB vs 20-30 GB), so it downloads fast
+        // and scans in one LINEAR sweep. One L5 voxel = a 32^3 L0 region; a shard
+        // is 1024^3 = 32^3 L5 voxels. Mark a shard dense on the first nonzero L5
+        // voxel inside it. Slightly coarser air detection than L4 but ample for
+        // an ETA. Independent of the export's L4 oracle.
         if (a.count_only) {
-            size_t air = 0, dense = 0, oob = 0;
-            const int64_t *shp2 = p.lvl.shape;
-            for (size_t si = 0; si < p.n_items; ++si) {
-                shard_coord sc = p.items[si];
-                int64_t oz = sc.sz * SHARD_VOX, oy = sc.sy * SHARD_VOX, ox = sc.sx * SHARD_VOX;
-                if (oz >= shp2[0] || oy >= shp2[1] || ox >= shp2[2]) { air++; oob++; continue; }
-                if (p.omap && p.omap->valid) {
-                    oracle_region orc;
-                    oracle_region_from_map(p.omap, oz, oy, ox, &orc);
-                    if (orc.all_zero) air++; else dense++;
+            int clvl = level + 5;  // L0 -> L5
+            int64_t cshape[3];
+            oracle_map cmap = {0};
+            if (fetch_level_shape(client, a.base, clvl, cshape) != 0) {
+                printf("L%d COUNT: count level L%d missing; skipped\n", level, clvl);
+            } else if (!a.oracle_cache_dir) {
+                printf("L%d COUNT: needs --oracle-cache-dir; skipped\n", level);
+            } else {
+                char cpath[2048];
+                snprintf(cpath, sizeof(cpath), "%s/%s_L%d.count",
+                         a.oracle_cache_dir, a.vol, clvl);
+                if (oracle_map_build(client, a.base, clvl, cshape, cpath, &cmap) != 0) {
+                    printf("L%d COUNT: L%d build failed; skipped\n", level, clvl);
                 } else {
-                    dense++;  // no oracle -> can't classify, assume work
+                    const int64_t *osh = cmap.shape;
+                    // shard = COUNT_EDGE count-voxels/axis. count level is L+5 =
+                    // 32x downscale; shard 1024^3 -> 1024/32 = 32 count voxels.
+                    const int64_t CE = SHARD_VOX / 32;  // 32
+                    unsigned char *sd = (unsigned char *)calloc(
+                        (size_t)nshard[0] * nshard[1] * nshard[2], 1);
+                    for (int64_t vz = 0; vz < osh[0]; ++vz) {
+                        int64_t sz = vz / CE; if (sz >= nshard[0]) continue;
+                        for (int64_t vy = 0; vy < osh[1]; ++vy) {
+                            int64_t sy = vy / CE; if (sy >= nshard[1]) continue;
+                            const uint8_t *row = cmap.base + ((size_t)vz * osh[1] + vy) * osh[2];
+                            int64_t srow = ((sz * nshard[1]) + sy) * nshard[2];
+                            for (int64_t vx = 0; vx < osh[2]; ++vx)
+                                if (row[vx]) { int64_t sx = vx / CE;
+                                    if (sx < nshard[2]) sd[srow + sx] = 1; }
+                        }
+                    }
+                    size_t dense = 0, tot = (size_t)nshard[0] * nshard[1] * nshard[2];
+                    for (size_t i = 0; i < tot; ++i) dense += sd[i];
+                    free(sd);
+                    printf("L%d COUNT (via L%d): %zu total | %zu dense (work) | %zu air\n",
+                           level, clvl, tot, dense, tot - dense);
+                    oracle_map_close(&cmap);
                 }
             }
-            printf("L%d COUNT: %zu total | %zu dense (work) | %zu air (%zu out-of-bounds)\n",
-                   level, p.n_items, dense, air, oob);
             free(p.items);
             if (omap.valid) oracle_map_close(&omap);
             continue;
