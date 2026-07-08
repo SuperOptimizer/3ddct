@@ -6,21 +6,31 @@ dct3d-compressed arrays with no further wiring.
 
 ## Install
 
+Use a **stable CPython (3.11–3.13)** in a virtualenv — `numpy`/`numcodecs`/`zarr`
+ship prebuilt wheels there, so nothing compiles from source. (Free-threaded
+`3.14t` and other bleeding-edge builds lack those wheels and will fail trying to
+compile numcodecs' Blosc/Zstd extensions — that's a numcodecs/toolchain issue,
+not dct3d.)
+
 ```sh
-# From this repo (builds the cffi extension — needs a C compiler):
-pip install "zarr>=3" numpy cffi
-pip install .                    # run in the repo root
+# from a clone of this repo:
+python3.13 -m venv .venv           # any stable 3.11–3.13
+source .venv/bin/activate
+
+pip install "zarr>=3" numpy cffi   # cffi builds the dct3d extension (needs a C compiler)
+pip install .                      # run in the repo root -> installs dct3d-zarr
 
 # To READ a remote export over HTTP, also:
 pip install pillow requests "fsspec[http]"
 ```
 
-Prebuilt binary wheels are built by CI (`.github/workflows/wheels.yml`) for
-Linux/macOS/Windows; once published to PyPI a plain `pip install dct3d-zarr`
-will need no compiler. The codec registers with zarr through a `zarr.codecs`
-entry point on install, so **reading needs no explicit import** — a stock
-`zarr.open(...)` on a dct3d array resolves the codec automatically. See
-[`examples/read_slice.py`](examples/read_slice.py) for a minimal reader.
+Prebuilt binary wheels for dct3d-zarr are built by CI
+(`.github/workflows/wheels.yml`) for Linux/macOS/Windows; once published to PyPI
+a plain `pip install dct3d-zarr` will need no compiler. The codec registers with
+zarr through a `zarr.codecs` entry point on install, so **reading needs no
+explicit import** — a stock `zarr.open(...)` on a dct3d array resolves the codec
+automatically. See [`examples/read_slice.py`](examples/read_slice.py) for a
+minimal reader.
 
 ```python
 import numpy as np

@@ -216,10 +216,13 @@ and read them back through the standard tools:
 
 ### Install the Python codec
 
+Use a **stable CPython (3.11–3.13)** in a virtualenv (not free-threaded `3.14t` —
+numcodecs has no wheels there and will fail to build):
+
 ```sh
-pip install "zarr>=3" numpy cffi          # runtime deps
-pip install .                             # builds dct3d-zarr from this repo
-#   (also pulls in mvec/C toolchain to compile the cffi extension)
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install "zarr>=3" numpy cffi          # cffi compiles the dct3d extension
+pip install .                             # installs dct3d-zarr from this repo
 ```
 
 Prebuilt wheels are produced by CI (`.github/workflows/wheels.yml`); until they
