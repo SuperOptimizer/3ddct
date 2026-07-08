@@ -2,9 +2,13 @@
 
 #include "oracle.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define SRC_CHUNK 128
 #define SRC_CHUNK3 ((size_t)SRC_CHUNK * SRC_CHUNK * SRC_CHUNK)
@@ -122,4 +126,156 @@ int oracle_chunk_is_air(const oracle_region *o, int64_t lz, int64_t ly, int64_t 
         }
     }
     return 1;
+}
+
+// ---- mmap-backed whole-level oracle ----------------------------------------
+
+// Scatter a fetched 128^3 chunk into the dense L4 file buffer at (cz,cy,cx).
+static void scatter_dense(uint8_t *dense, const int64_t shp[3],
+                          int64_t cz, int64_t cy, int64_t cx, const uint8_t *chunk) {
+    for (int z = 0; z < SRC_CHUNK; ++z) {
+        int64_t vz = cz * SRC_CHUNK + z; if (vz >= shp[0]) break;
+        for (int y = 0; y < SRC_CHUNK; ++y) {
+            int64_t vy = cy * SRC_CHUNK + y; if (vy >= shp[1]) break;
+            int64_t vx0 = cx * SRC_CHUNK;
+            int64_t w = SRC_CHUNK; if (vx0 + w > shp[2]) w = shp[2] - vx0;
+            if (w <= 0) continue;
+            memcpy(dense + ((size_t)vz * shp[1] + vy) * shp[2] + vx0,
+                   chunk + ((size_t)z * SRC_CHUNK + y) * SRC_CHUNK, (size_t)w);
+        }
+    }
+}
+
+int oracle_map_build(s3_client *client, const char *vol_base, int oracle_level,
+                     const int64_t shp[3], const char *path, oracle_map *out) {
+    memset(out, 0, sizeof(*out));
+    const size_t bytes = (size_t)shp[0] * shp[1] * shp[2];
+
+    // Reuse an existing complete file (a `.done` marker guards partial downloads).
+    char done[2048];
+    snprintf(done, sizeof(done), "%s.done", path);
+    struct stat st;
+    int have = (stat(path, &st) == 0 && (size_t)st.st_size == bytes &&
+                stat(done, &st) == 0);
+
+    if (!have) {
+        // Fresh download written straight into a disk-backed, zero-filled file
+        // mmap'd WRITABLE — the page cache holds only the hot pages, so we never
+        // hold the whole 20-30 GB in RAM. Write to a temp path, rename on success.
+        char tmp[2048];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        int wfd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (wfd < 0) { fprintf(stderr, "oracle_map: open %s failed\n", tmp); return -1; }
+        if (ftruncate(wfd, (off_t)bytes) != 0) {
+            fprintf(stderr, "oracle_map: ftruncate %zu failed\n", bytes);
+            close(wfd); return -1;
+        }
+        uint8_t *dense = (uint8_t *)mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED, wfd, 0);
+        if (dense == MAP_FAILED) {
+            fprintf(stderr, "oracle_map: mmap(write) failed\n"); close(wfd); return -1;
+        }
+        int64_t ncz = (shp[0] + SRC_CHUNK - 1) / SRC_CHUNK;
+        int64_t ncy = (shp[1] + SRC_CHUNK - 1) / SRC_CHUNK;
+        int64_t ncx = (shp[2] + SRC_CHUNK - 1) / SRC_CHUNK;
+        size_t total = (size_t)ncz * ncy * ncx, got = 0, air = 0;
+        fprintf(stderr, "oracle_map: downloading L%d [%lld,%lld,%lld] = %.1f GB "
+                "(%zu chunks) -> %s\n", oracle_level, (long long)shp[0],
+                (long long)shp[1], (long long)shp[2], bytes / 1e9, total, path);
+
+        // Fetch in batches to bound the URL/response arrays.
+        const size_t BATCH = 256;
+        char (*urls)[1280] = malloc(BATCH * sizeof(*urls));
+        uint8_t *bufs = malloc(BATCH * SRC_CHUNK3);
+        s3_range_req *reqs = calloc(BATCH, sizeof(s3_range_req));
+        s3_response *resp = calloc(BATCH, sizeof(s3_response));
+        int64_t coords[256][3];
+        if (!urls || !bufs || !reqs || !resp) { free(dense); return -1; }
+
+        int rc = 0;
+        for (int64_t cz = 0; cz < ncz && rc == 0; ++cz)
+            for (int64_t cy = 0; cy < ncy && rc == 0; ++cy)
+                for (int64_t cx0 = 0; cx0 < ncx && rc == 0; cx0 += BATCH) {
+                    size_t n = 0;
+                    for (int64_t cx = cx0; cx < ncx && n < BATCH; ++cx, ++n) {
+                        coords[n][0] = cz; coords[n][1] = cy; coords[n][2] = cx;
+                        snprintf(urls[n], sizeof(urls[n]), "%s/%d/%lld/%lld/%lld",
+                                 vol_base, oracle_level, (long long)cz, (long long)cy,
+                                 (long long)cx);
+                        reqs[n] = (s3_range_req){urls[n], 0, SRC_CHUNK3, bufs + n * SRC_CHUNK3};
+                    }
+                    s3_status s = s3_get_batch(client, reqs, n, 0, resp);
+                    if (s != S3_OK && s != S3_ERR_HTTP) { rc = -1; }
+                    else for (size_t i = 0; i < n; ++i) {
+                        long code = resp[i].status;
+                        if (code == 404) { air++; }
+                        else if (code >= 200 && code < 300 && resp[i].body_len == SRC_CHUNK3) {
+                            scatter_dense(dense, shp, coords[i][0], coords[i][1],
+                                          coords[i][2], bufs + i * SRC_CHUNK3);
+                        } else {
+                            fprintf(stderr, "oracle_map: %s -> HTTP %ld / %zu B (hard)\n",
+                                    urls[i], code, resp[i].body_len);
+                            rc = -1;
+                        }
+                        got++;
+                    }
+                    for (size_t i = 0; i < n; ++i) s3_response_free(&resp[i]);
+                    if (got % 4096 < BATCH)
+                        fprintf(stderr, "oracle_map: %zu/%zu chunks (%zu air)\n",
+                                got, total, air);
+                }
+        free(urls); free(bufs); free(reqs); free(resp);
+        if (rc != 0) { munmap(dense, bytes); close(wfd); unlink(tmp); return -1; }
+
+        // Flush the mapped pages to disk, unmap, close, atomic rename + marker.
+        msync(dense, bytes, MS_SYNC);
+        munmap(dense, bytes);
+        close(wfd);
+        rename(tmp, path);
+        FILE *df = fopen(done, "w"); if (df) fclose(df);
+        fprintf(stderr, "oracle_map: L%d materialized (%zu air of %zu chunks)\n",
+                oracle_level, air, total);
+    } else {
+        fprintf(stderr, "oracle_map: reusing existing %s (%.1f GB)\n", path, bytes / 1e9);
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "oracle_map: open %s failed\n", path); return -1; }
+    void *m = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { fprintf(stderr, "oracle_map: mmap failed\n"); close(fd); return -1; }
+    madvise(m, bytes, MADV_RANDOM);  // random access, don't read-ahead the whole file
+    out->base = (const uint8_t *)m;
+    out->shape[0] = shp[0]; out->shape[1] = shp[1]; out->shape[2] = shp[2];
+    out->level = oracle_level; out->bytes = bytes; out->fd = fd; out->valid = 1;
+    return 0;
+}
+
+void oracle_map_close(oracle_map *m) {
+    if (m->base) munmap((void *)m->base, m->bytes);
+    if (m->fd >= 0) close(m->fd);
+    m->base = NULL; m->valid = 0;
+}
+
+void oracle_region_from_map(const oracle_map *m, int64_t oz, int64_t oy, int64_t ox,
+                            oracle_region *out) {
+    memset(out, 0, sizeof(*out));
+    const int64_t E = ORACLE_EDGE;
+    // Shard origin in oracle-voxel space.
+    int64_t ooz = oz / ORACLE_SCALE, ooy = oy / ORACLE_SCALE, oox = ox / ORACLE_SCALE;
+    const int64_t *shp = m->shape;
+    int any = 0;
+    for (int64_t z = 0; z < E; ++z) {
+        int64_t vz = ooz + z; if (vz < 0 || vz >= shp[0]) continue;
+        for (int64_t y = 0; y < E; ++y) {
+            int64_t vy = ooy + y; if (vy < 0 || vy >= shp[1]) continue;
+            for (int64_t x = 0; x < E; ++x) {
+                int64_t vx = oox + x; if (vx < 0 || vx >= shp[2]) continue;
+                uint8_t v = m->base[((size_t)vz * shp[1] + vy) * shp[2] + vx];
+                out->vox[((size_t)z * E + y) * E + x] = v;
+                if (v) any = 1;
+            }
+        }
+    }
+    out->valid = 1;
+    out->all_zero = !any;
 }

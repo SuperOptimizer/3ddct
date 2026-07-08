@@ -39,6 +39,34 @@ static inline int oracle_level_for(int level) {
     return (level == 0 || level == 1) ? level + 4 : -1;
 }
 
+// A whole oracle level materialized to a local dense file and mmap'd read-only.
+// For big 2.4um volumes the L4 level is 20-30 GB — too big for RAM, but it fits
+// on disk and the OS page-caches the hot pages, so per-shard lookups are just
+// mapped-memory reads with no S3 traffic and near-zero resident RAM.
+typedef struct {
+    const uint8_t *base;   // mmap'd dense ZYX u8, shape[0]*shape[1]*shape[2]
+    int64_t shape[3];
+    int level;
+    size_t bytes;
+    int fd;
+    int valid;
+} oracle_map;
+
+// Download `oracle_level` of the volume at `vol_base` into `path` (dense ZYX u8;
+// reused if already complete) and mmap it. `client` fetches the 128^3 source
+// chunks in parallel; missing chunks (404) are zero. Returns 0 on success (sets
+// out->valid), -1 on failure (out->valid=0; caller falls back to S3 per-shard).
+int oracle_map_build(s3_client *client, const char *vol_base, int oracle_level,
+                     const int64_t oracle_shape[3], const char *path,
+                     oracle_map *out);
+
+void oracle_map_close(oracle_map *m);
+
+// Fill `out` (a 64^3 region) for the shard at export-level origin (oz,oy,ox)
+// straight from the mmap'd oracle — no S3. Always succeeds (out->valid=1).
+void oracle_region_from_map(const oracle_map *m, int64_t oz, int64_t oy, int64_t ox,
+                            oracle_region *out);
+
 // Fill `out` with the oracle voxels covering the shard at (oz,oy,ox) voxels of
 // the EXPORT level. `oracle_base`/`oracle_shape` describe the oracle level.
 // Returns 0 on success (out->valid set appropriately), -1 on hard fetch error.

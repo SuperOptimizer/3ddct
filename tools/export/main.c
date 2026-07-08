@@ -124,6 +124,7 @@ typedef struct {
     int oracle_level;
     char oracle_base[1024];
     int64_t oracle_shape[3];
+    oracle_map *omap;   // mmap'd whole-L4 oracle (NULL -> per-shard S3 fetch)
 
     // work source (shard coords)
     shard_coord *items;
@@ -165,10 +166,14 @@ static void *download_main(void *arg) {
         oracle_region orc;
         orc.valid = 0;
         if (!fully_air && p->oracle_level >= 0) {
-            if (oracle_fetch(p->client, p->oracle_base, p->oracle_level,
-                             p->oracle_shape, oz, oy, ox, &orc) != 0)
+            if (p->omap && p->omap->valid) {
+                // mmap'd whole-L4 oracle: pure mapped reads, no S3.
+                oracle_region_from_map(p->omap, oz, oy, ox, &orc);
+            } else if (oracle_fetch(p->client, p->oracle_base, p->oracle_level,
+                                    p->oracle_shape, oz, oy, ox, &orc) != 0) {
                 orc.valid = 0;
-            else if (orc.valid && orc.all_zero) {
+            }
+            if (orc.valid && orc.all_zero) {
                 fully_air = 1;
                 atomic_fetch_add(&p->air_shards, 1);
             }
@@ -294,6 +299,8 @@ typedef struct {
     int64_t only[3];   // if only[0]>=0, process just this one shard coord
     double ram_budget_gb;  // bound on in-flight ~1 GiB buffers
     int dl_threads, ul_threads;  // 0 -> derived from --threads
+    const char *oracle_cache_dir;  // if set, materialize+mmap the oracle level here
+    int count_only;    // classify shards air/dense via oracle, print counts, exit
 } args_t;
 
 static void parse_levels(const char *s, int *lo, int *hi) {
@@ -332,6 +339,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--known-hosts")) a.known_hosts = argval(argc, argv, &i);
         else if (!strcmp(argv[i], "--limit-shards")) a.limit_shards = atol(argval(argc, argv, &i));
         else if (!strcmp(argv[i], "--no-oracle")) a.no_oracle = 1;
+        else if (!strcmp(argv[i], "--oracle-cache-dir")) a.oracle_cache_dir = argval(argc, argv, &i);
+        else if (!strcmp(argv[i], "--count-only")) a.count_only = 1;
         else if (!strcmp(argv[i], "--resume")) a.resume = 1;
         else if (!strcmp(argv[i], "--ram-budget-gb")) a.ram_budget_gb = atof(argval(argc, argv, &i));
         else if (!strcmp(argv[i], "--dl-threads")) a.dl_threads = atoi(argval(argc, argv, &i));
@@ -350,8 +359,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "required: --base --scroll --vol --um (and sftp opts unless --dry-run)\n");
         return 2;
     }
-    if (!a.dry_run && (!a.sftp_host || !a.sftp_user || !a.sftp_pass)) {
-        fprintf(stderr, "--sftp-host/user/pass required unless --dry-run\n");
+    if (!a.dry_run && !a.count_only && (!a.sftp_host || !a.sftp_user || !a.sftp_pass)) {
+        fprintf(stderr, "--sftp-host/user/pass required unless --dry-run/--count-only\n");
         return 2;
     }
 
@@ -401,6 +410,25 @@ int main(int argc, char **argv) {
                        (long long)oracle_shape[1], (long long)oracle_shape[2]);
             }
         }
+
+        // Materialize the oracle level to disk + mmap when a cache dir is given.
+        // For big 2.4um volumes L4 is 20-30 GB — too big for RAM but fine on
+        // disk, and the OS page-caches it, so per-shard lookups are mapped reads
+        // with no S3 traffic. Without --oracle-cache-dir we fall back to the
+        // per-shard 64^3 S3 fetch (fine for small volumes).
+        oracle_map omap = {0};
+        if (oracle_level >= 0 && a.oracle_cache_dir) {
+            char opath[2048];
+            snprintf(opath, sizeof(opath), "%s/%s_L%d.oracle",
+                     a.oracle_cache_dir, a.vol, oracle_level);
+            if (oracle_map_build(client, a.base, oracle_level, oracle_shape, opath,
+                                 &omap) != 0) {
+                fprintf(stderr, "L%d: oracle mmap build failed — falling back to "
+                        "per-shard S3 oracle\n", level);
+                omap.valid = 0;
+            }
+        }
+
         pipeline p = {0};
         p.client = client;
         p.lvl.level = level;
@@ -415,6 +443,7 @@ int main(int argc, char **argv) {
         p.oracle_shape[0] = oracle_shape[0];
         p.oracle_shape[1] = oracle_shape[1];
         p.oracle_shape[2] = oracle_shape[2];
+        p.omap = omap.valid ? &omap : NULL;
 
         // Build the shard-coord work list.
         p.items = (shard_coord *)malloc(total * sizeof(shard_coord));
@@ -430,6 +459,30 @@ int main(int argc, char **argv) {
         p.n_items = k;
         if (a.limit_shards >= 0 && (size_t)a.limit_shards < p.n_items)
             p.n_items = a.limit_shards;
+
+        // Count-only: classify every shard air/dense via the oracle (no fetch,
+        // no encode) for an accurate work estimate + ETA. Needs the oracle.
+        if (a.count_only) {
+            size_t air = 0, dense = 0, oob = 0;
+            const int64_t *shp2 = p.lvl.shape;
+            for (size_t si = 0; si < p.n_items; ++si) {
+                shard_coord sc = p.items[si];
+                int64_t oz = sc.sz * SHARD_VOX, oy = sc.sy * SHARD_VOX, ox = sc.sx * SHARD_VOX;
+                if (oz >= shp2[0] || oy >= shp2[1] || ox >= shp2[2]) { air++; oob++; continue; }
+                if (p.omap && p.omap->valid) {
+                    oracle_region orc;
+                    oracle_region_from_map(p.omap, oz, oy, ox, &orc);
+                    if (orc.all_zero) air++; else dense++;
+                } else {
+                    dense++;  // no oracle -> can't classify, assume work
+                }
+            }
+            printf("L%d COUNT: %zu total | %zu dense (work) | %zu air (%zu out-of-bounds)\n",
+                   level, p.n_items, dense, air, oob);
+            free(p.items);
+            if (omap.valid) oracle_map_close(&omap);
+            continue;
+        }
 
         // Pool sizes: compress = --threads (CPU-bound); download/upload default
         // to 2x that (network-bound, mostly blocked). Buffer pool + queue depths
@@ -491,6 +544,7 @@ int main(int argc, char **argv) {
         bq_destroy(&p.vol_q);
         bq_destroy(&p.shard_q);
         free(p.items);
+        if (omap.valid) oracle_map_close(&omap);
     }
 
     // Upload the OME group zarr.json once (references levels as multiscales).
