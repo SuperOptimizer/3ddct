@@ -58,3 +58,35 @@ int sftp_upload(const sftp_target *t, const char *remote_path,
     curl_easy_cleanup(h);
     return res == CURLE_OK ? 0 : -1;
 }
+
+long sftp_size(const sftp_target *t, const char *remote_path) {
+    CURL *h = curl_easy_init();
+    if (!h) return -1;
+
+    char url[2048], userpwd[512];
+    snprintf(url, sizeof(url), "sftp://%s:%d%s", t->host, t->port, remote_path);
+    snprintf(userpwd, sizeof(userpwd), "%s:%s", t->user, t->pass);
+
+    // NOBODY + FILETIME triggers an SFTP stat without transferring the file.
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_USERPWD, userpwd);
+    curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(h, CURLOPT_FILETIME, 1L);
+    if (t->known_hosts)
+        curl_easy_setopt(h, CURLOPT_SSH_KNOWNHOSTS, t->known_hosts);
+    curl_easy_setopt(h, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 30L);
+
+    long size = -1;
+    CURLcode res = curl_easy_perform(h);
+    if (res == CURLE_OK) {
+        curl_off_t len = -1;
+        if (curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &len) == CURLE_OK &&
+            len >= 0)
+            size = (long)len;
+        else
+            size = 0;  // exists but size unknown
+    }
+    curl_easy_cleanup(h);
+    return size;
+}

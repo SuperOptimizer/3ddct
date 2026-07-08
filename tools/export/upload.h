@@ -26,6 +26,11 @@ typedef struct {
 int sftp_upload(const sftp_target *t, const char *remote_path,
                 const uint8_t *data, size_t len);
 
+// Return the remote file size (>= 0) if `remote_path` exists, or -1 if it does
+// not exist / cannot be stat'd. Used for resume (skip already-uploaded shards).
+// Thread-safe.
+long sftp_size(const sftp_target *t, const char *remote_path);
+
 // One-time global libcurl init (call once before threads start).
 void sftp_global_init(void);
 

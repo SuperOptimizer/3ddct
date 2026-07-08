@@ -1,19 +1,24 @@
 // dct3d_export — stream a source OME-zarr volume level to a dct3d-compressed,
-// sharded Zarr v3 volume on an SFTP server.
+// sharded Zarr v3 volume on an SFTP server, via a three-pool pipeline.
 //
-// Per shard (SHARD_VOX^3, one worker thread each): batched-fetch the source
-// 128^3 chunks from S3/HTTP, assemble a dense volume (zero-padded past the real
-// extent), dct3d-encode its 16^3 inner chunks into a sharding_indexed shard,
-// SFTP it to optimized/<scroll>/<vol>.zarr/<L>/<z>/<y>/<x>, then free it. The
-// array dims are padded up to a whole multiple of SHARD_VOX, so every shard is
-// a full SHARD_VOX^3 (edge shards are zero-filled past the volume).
+// download pool -> [dense-volume queue] -> compress pool -> [shard queue] ->
+// upload pool. Each stage runs concurrently on its own resource (network in /
+// CPU / network out) so compression never blocks on I/O; bounded queues + a
+// reusable buffer pool bound in-flight RAM. Per shard: batched-fetch the source
+// 128^3 chunks (libs3), assemble a dense SHARD_VOX^3 volume (zero-padded past
+// the real extent), dct3d-encode its 16^3 inner chunks into a sharding_indexed
+// shard, SFTP it to <root>/<scroll>/<vol>.zarr/<L>/<z>/<y>/<x>. Dims are padded
+// up to a whole multiple of SHARD_VOX (full zero-filled edge shards).
+//
+// Default is level 0 only; pass --levels to export others.
 //
 // Usage:
 //   dct3d_export --base <https-zarr-root> --scroll <PHercId> --vol <name.zarr>
-//                --um <voxel-um> --levels 0-5 --threads N
+//                --um <voxel-um> [--levels 0] --threads N [--ram-budget-gb G]
 //                --sftp-host H --sftp-port P --sftp-user U --sftp-pass X
-//                [--known-hosts path] [--remote-root optimized]
-//                [--limit-shards N] [--dry-run]
+//                [--known-hosts path] [--remote-root exports] [--resume]
+//                [--dl-threads N] [--ul-threads N]
+//                [--limit-shards N] [--only-shard z,y,x] [--no-oracle] [--dry-run]
 
 #include <curl/curl.h>
 #include <pthread.h>
@@ -23,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bqueue.h"
 #include "fetch.h"
 #include "ladder.h"
 #include "oracle.h"
@@ -59,122 +65,186 @@ static int fetch_level_shape(s3_client *c, const char *base, int level,
     return rc;
 }
 
-// ---- work queue ------------------------------------------------------------
+// ---- three-pool pipeline ---------------------------------------------------
+//
+// download pool -> [dense-volume queue] -> compress pool -> [shard queue] ->
+// upload pool. The stages run concurrently on their own resource (network in /
+// CPU / network out); bounded queues bound in-flight RAM and apply backpressure.
+// A dense 1024^3 volume and an encoded shard are each ~1 GiB, so queue depths
+// are sized from a RAM budget.
 
 typedef struct {
-    int64_t sz, sy, sx;  // shard grid coordinate
+    int64_t sz, sy, sx;
 } shard_coord;
 
+// A dense-volume work item flowing download -> compress.
 typedef struct {
-    shard_coord *items;
-    size_t n, next;
-    pthread_mutex_t lock;
-    atomic_size_t done, failed, skipped;
-} work_queue;
+    shard_coord sc;
+    uint8_t *vol;   // SHARD_VOX^3 dense (owned; returned to buffer pool after encode)
+    int all_air;    // known-empty (skip real encode work but still emit shard)
+} vol_item;
 
+// An encoded-shard item flowing compress -> upload.
 typedef struct {
+    shard_coord sc;
+    uint8_t *shard;   // encoded bytes (malloc'd; freed after upload)
+    size_t len;
+} shard_item;
+
+// A fixed pool of reusable SHARD_VOX^3 buffers (avoids per-shard 1 GiB
+// malloc/free churn — perf showed millions of page faults). Blocking acquire.
+typedef struct {
+    bqueue free_slots;  // holds uint8_t* buffers
+} buf_pool;
+
+static void buf_pool_init(buf_pool *p, size_t n) {
+    bq_init(&p->free_slots, n);
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t *b = (uint8_t *)malloc((size_t)SHARD_VOX * SHARD_VOX * SHARD_VOX);
+        if (!b) { fprintf(stderr, "buf_pool: OOM allocating slot %zu\n", i); exit(1); }
+        bq_push(&p->free_slots, b);
+    }
+}
+static uint8_t *buf_acquire(buf_pool *p) {
+    void *b = NULL;
+    bq_pop(&p->free_slots, &b);
+    return (uint8_t *)b;
+}
+static void buf_release(buf_pool *p, uint8_t *b) { bq_push(&p->free_slots, b); }
+
+// Shared pipeline state for one level.
+typedef struct {
+    // config
     s3_client *client;
     src_level lvl;
     float quality, tau;
-    const char *remote_root;   // "exports"
-    const char *scroll;        // PHercId
-    const char *vol;           // <name>.zarr
+    const char *remote_root, *scroll, *vol;
     sftp_target sftp;
-    work_queue *q;
-    int dry_run;
-    int worker_id;
-    // Air oracle (L0<-L4, L1<-L5); oracle_level < 0 => disabled.
+    int dry_run, resume;
     int oracle_level;
     char oracle_base[1024];
     int64_t oracle_shape[3];
-    atomic_size_t *air_shards;  // count of whole-shard skips (shared)
-} worker_ctx;
 
-static int next_shard(work_queue *q, shard_coord *out) {
-    pthread_mutex_lock(&q->lock);
-    int have = 0;
-    if (q->next < q->n) { *out = q->items[q->next++]; have = 1; }
-    pthread_mutex_unlock(&q->lock);
-    return have;
-}
+    // work source (shard coords)
+    shard_coord *items;
+    size_t n_items;
+    atomic_size_t next_item;
 
-static void *worker_main(void *arg) {
-    worker_ctx *w = (worker_ctx *)arg;
-    uint8_t *vol = (uint8_t *)malloc((size_t)SHARD_VOX * SHARD_VOX * SHARD_VOX);
-    if (!vol) { fprintf(stderr, "[w%d] OOM vol\n", w->worker_id); return NULL; }
+    // stage queues + buffer pool
+    bqueue vol_q;      // vol_item*
+    bqueue shard_q;    // shard_item*
+    buf_pool bufs;
 
-    shard_coord sc;
-    while (next_shard(w->q, &sc)) {
+    // counters
+    atomic_size_t done, failed, skipped, air_shards;
+} pipeline;
+
+// Download pool: pull a shard coord, resume-check, oracle-check, fetch the dense
+// volume from a pool buffer, push to vol_q. Empty shards ride through as all_air.
+static void *download_main(void *arg) {
+    pipeline *p = (pipeline *)arg;
+    for (;;) {
+        size_t idx = atomic_fetch_add(&p->next_item, 1);
+        if (idx >= p->n_items) break;
+        shard_coord sc = p->items[idx];
         int64_t oz = sc.sz * SHARD_VOX, oy = sc.sy * SHARD_VOX, ox = sc.sx * SHARD_VOX;
 
-        // Fast path 1: a shard whose origin is at or past the real (unpadded)
-        // extent on any axis is entirely in the zero-padded region — every
-        // source chunk would 404 to air. Skip fetch, emit the all-sentinel shard.
-        const int64_t *shp = w->lvl.shape;
-        int fully_air = (oz >= shp[0] || oy >= shp[1] || ox >= shp[2]);
-
-        oracle_region orc;
-        orc.valid = 0;
-        if (!fully_air && w->oracle_level >= 0) {
-            if (oracle_fetch(w->client, w->oracle_base, w->oracle_level,
-                             w->oracle_shape, oz, oy, ox, &orc) != 0) {
-                // Oracle fetch failed hard — fall back to fetching everything.
-                orc.valid = 0;
-            } else if (orc.valid && orc.all_zero) {
-                // Fast path 2: the coarse oracle says the whole shard is air.
-                fully_air = 1;
-                atomic_fetch_add(w->air_shards, 1);
+        if (p->resume && !p->dry_run) {
+            char remote[1536];
+            snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/%lld/%lld/%lld",
+                     p->remote_root, p->scroll, p->vol, p->lvl.level,
+                     (long long)sc.sz, (long long)sc.sy, (long long)sc.sx);
+            if (sftp_size(&p->sftp, remote) >= 0) {
+                atomic_fetch_add(&p->skipped, 1);
+                continue;
             }
         }
 
+        const int64_t *shp = p->lvl.shape;
+        int fully_air = (oz >= shp[0] || oy >= shp[1] || ox >= shp[2]);
+        oracle_region orc;
+        orc.valid = 0;
+        if (!fully_air && p->oracle_level >= 0) {
+            if (oracle_fetch(p->client, p->oracle_base, p->oracle_level,
+                             p->oracle_shape, oz, oy, ox, &orc) != 0)
+                orc.valid = 0;
+            else if (orc.valid && orc.all_zero) {
+                fully_air = 1;
+                atomic_fetch_add(&p->air_shards, 1);
+            }
+        }
+
+        uint8_t *vol = buf_acquire(&p->bufs);
         if (fully_air) {
             memset(vol, 0, (size_t)SHARD_VOX * SHARD_VOX * SHARD_VOX);
-        } else if (fetch_shard_region(w->client, &w->lvl, oz, oy, ox, vol,
+        } else if (fetch_shard_region(p->client, &p->lvl, oz, oy, ox, vol,
                                       orc.valid ? &orc : NULL) != 0) {
-            fprintf(stderr, "[w%d] fetch failed shard %lld/%lld/%lld L%d\n",
-                    w->worker_id, (long long)sc.sz, (long long)sc.sy,
-                    (long long)sc.sx, w->lvl.level);
-            atomic_fetch_add(&w->q->failed, 1);
+            fprintf(stderr, "download: fetch failed %lld/%lld/%lld L%d\n",
+                    (long long)sc.sz, (long long)sc.sy, (long long)sc.sx, p->lvl.level);
+            atomic_fetch_add(&p->failed, 1);
+            buf_release(&p->bufs, vol);
             continue;
         }
 
+        vol_item *vi = (vol_item *)malloc(sizeof(vol_item));
+        vi->sc = sc; vi->vol = vol; vi->all_air = fully_air;
+        if (!bq_push(&p->vol_q, vi)) { buf_release(&p->bufs, vol); free(vi); }
+    }
+    return NULL;
+}
+
+// Compress pool: pop a dense volume, encode it, return the buffer to the pool,
+// push the encoded shard to shard_q.
+static void *compress_main(void *arg) {
+    pipeline *p = (pipeline *)arg;
+    void *item;
+    while (bq_pop(&p->vol_q, &item)) {
+        vol_item *vi = (vol_item *)item;
         uint8_t *shard = NULL;
-        size_t shard_len = 0;
-        if (shard_encode_u8(vol, w->quality, w->tau, &shard, &shard_len) != 0) {
-            fprintf(stderr, "[w%d] encode OOM shard %lld/%lld/%lld\n",
-                    w->worker_id, (long long)sc.sz, (long long)sc.sy, (long long)sc.sx);
-            atomic_fetch_add(&w->q->failed, 1);
+        size_t len = 0;
+        int rc = shard_encode_u8(vi->vol, p->quality, p->tau, &shard, &len);
+        buf_release(&p->bufs, vi->vol);  // volume no longer needed
+        if (rc != 0) {
+            fprintf(stderr, "compress: encode OOM %lld/%lld/%lld\n",
+                    (long long)vi->sc.sz, (long long)vi->sc.sy, (long long)vi->sc.sx);
+            atomic_fetch_add(&p->failed, 1);
+            free(vi);
             continue;
         }
+        shard_item *si = (shard_item *)malloc(sizeof(shard_item));
+        si->sc = vi->sc; si->shard = shard; si->len = len;
+        free(vi);
+        if (!bq_push(&p->shard_q, si)) { free(shard); free(si); }
+    }
+    return NULL;
+}
 
+// Upload pool: pop an encoded shard, SFTP it, free it.
+static void *upload_main(void *arg) {
+    pipeline *p = (pipeline *)arg;
+    void *item;
+    while (bq_pop(&p->shard_q, &item)) {
+        shard_item *si = (shard_item *)item;
         char remote[1536];
         snprintf(remote, sizeof(remote), "/%s/%s/%s/%d/%lld/%lld/%lld",
-                 w->remote_root, w->scroll, w->vol, w->lvl.level,
-                 (long long)sc.sz, (long long)sc.sy, (long long)sc.sx);
-
-        int ok = 0;
-        if (w->dry_run) {
-            ok = 1;
-        } else {
-            ok = sftp_upload(&w->sftp, remote, shard, shard_len) == 0;
+                 p->remote_root, p->scroll, p->vol, p->lvl.level,
+                 (long long)si->sc.sz, (long long)si->sc.sy, (long long)si->sc.sx);
+        int ok = p->dry_run ? 1 : (sftp_upload(&p->sftp, remote, si->shard, si->len) == 0);
+        if (ok) atomic_fetch_add(&p->done, 1);
+        else {
+            fprintf(stderr, "upload: failed %s\n", remote);
+            atomic_fetch_add(&p->failed, 1);
         }
-        free(shard);
-
-        if (ok) {
-            atomic_fetch_add(&w->q->done, 1);
-        } else {
-            fprintf(stderr, "[w%d] upload failed %s\n", w->worker_id, remote);
-            atomic_fetch_add(&w->q->failed, 1);
-        }
+        free(si->shard);
+        free(si);
     }
-    free(vol);
     return NULL;
 }
 
 // ---- zarr.json emission ----------------------------------------------------
 
 // Emit the per-level array zarr.json (padded shape, dct3d codec) and upload it.
-static int upload_level_metadata(const worker_ctx *base, int64_t padded[3],
+static int upload_level_metadata(const pipeline *base, int64_t padded[3],
                                  float quality, float tau) {
     char zj[2048];
     snprintf(zj, sizeof(zj),
@@ -220,7 +290,10 @@ typedef struct {
     long limit_shards;
     double um;
     int no_oracle;
+    int resume;        // skip shards already present on the server
     int64_t only[3];   // if only[0]>=0, process just this one shard coord
+    double ram_budget_gb;  // bound on in-flight ~1 GiB buffers
+    int dl_threads, ul_threads;  // 0 -> derived from --threads
 } args_t;
 
 static void parse_levels(const char *s, int *lo, int *hi) {
@@ -238,10 +311,11 @@ int main(int argc, char **argv) {
     args_t a = {0};
     a.remote_root = "exports";
     a.threads = 6;
-    a.lvl_lo = 0; a.lvl_hi = 5;
+    a.lvl_lo = 0; a.lvl_hi = 0;  // level 0 only by default (override with --levels)
     a.sftp_port = 22;
     a.limit_shards = -1;
     a.only[0] = -1;
+    a.ram_budget_gb = 10.0;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--base")) a.base = argval(argc, argv, &i);
@@ -258,6 +332,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--known-hosts")) a.known_hosts = argval(argc, argv, &i);
         else if (!strcmp(argv[i], "--limit-shards")) a.limit_shards = atol(argval(argc, argv, &i));
         else if (!strcmp(argv[i], "--no-oracle")) a.no_oracle = 1;
+        else if (!strcmp(argv[i], "--resume")) a.resume = 1;
+        else if (!strcmp(argv[i], "--ram-budget-gb")) a.ram_budget_gb = atof(argval(argc, argv, &i));
+        else if (!strcmp(argv[i], "--dl-threads")) a.dl_threads = atoi(argval(argc, argv, &i));
+        else if (!strcmp(argv[i], "--ul-threads")) a.ul_threads = atoi(argval(argc, argv, &i));
         else if (!strcmp(argv[i], "--only-shard")) {
             const char *v = argval(argc, argv, &i);
             if (sscanf(v, "%lld,%lld,%lld", (long long *)&a.only[0],
@@ -323,59 +401,96 @@ int main(int argc, char **argv) {
                        (long long)oracle_shape[1], (long long)oracle_shape[2]);
             }
         }
-        atomic_size_t air_shards = 0;
+        pipeline p = {0};
+        p.client = client;
+        p.lvl.level = level;
+        p.lvl.src_chunk = 128;
+        snprintf(p.lvl.base, sizeof(p.lvl.base), "%s", a.base);
+        p.lvl.shape[0] = shape[0]; p.lvl.shape[1] = shape[1]; p.lvl.shape[2] = shape[2];
+        p.quality = quality; p.tau = tau;
+        p.remote_root = a.remote_root; p.scroll = a.scroll; p.vol = a.vol;
+        p.sftp = sftp; p.dry_run = a.dry_run; p.resume = a.resume;
+        p.oracle_level = oracle_level;
+        snprintf(p.oracle_base, sizeof(p.oracle_base), "%s", a.base);
+        p.oracle_shape[0] = oracle_shape[0];
+        p.oracle_shape[1] = oracle_shape[1];
+        p.oracle_shape[2] = oracle_shape[2];
 
-        work_queue q = {0};
-        q.items = (shard_coord *)malloc(total * sizeof(shard_coord));
-        pthread_mutex_init(&q.lock, NULL);
+        // Build the shard-coord work list.
+        p.items = (shard_coord *)malloc(total * sizeof(shard_coord));
         size_t k = 0;
         if (a.only[0] >= 0) {
-            q.items[k++] = (shard_coord){a.only[0], a.only[1], a.only[2]};
+            p.items[k++] = (shard_coord){a.only[0], a.only[1], a.only[2]};
         } else {
             for (int64_t z = 0; z < nshard[0]; ++z)
                 for (int64_t y = 0; y < nshard[1]; ++y)
                     for (int64_t x = 0; x < nshard[2]; ++x)
-                        q.items[k++] = (shard_coord){z, y, x};
+                        p.items[k++] = (shard_coord){z, y, x};
         }
-        q.n = k;
-        if (a.limit_shards >= 0 && (size_t)a.limit_shards < q.n) q.n = a.limit_shards;
+        p.n_items = k;
+        if (a.limit_shards >= 0 && (size_t)a.limit_shards < p.n_items)
+            p.n_items = a.limit_shards;
 
-        worker_ctx base = {0};
-        base.client = client;
-        base.lvl.level = level;
-        base.lvl.src_chunk = 128;
-        snprintf(base.lvl.base, sizeof(base.lvl.base), "%s", a.base);
-        base.lvl.shape[0] = shape[0]; base.lvl.shape[1] = shape[1]; base.lvl.shape[2] = shape[2];
-        base.quality = quality; base.tau = tau;
-        base.remote_root = a.remote_root; base.scroll = a.scroll; base.vol = a.vol;
-        base.sftp = sftp; base.q = &q; base.dry_run = a.dry_run;
-        base.oracle_level = oracle_level;
-        snprintf(base.oracle_base, sizeof(base.oracle_base), "%s", a.base);
-        base.oracle_shape[0] = oracle_shape[0];
-        base.oracle_shape[1] = oracle_shape[1];
-        base.oracle_shape[2] = oracle_shape[2];
-        base.air_shards = &air_shards;
+        // Pool sizes: compress = --threads (CPU-bound); download/upload default
+        // to 2x that (network-bound, mostly blocked). Buffer pool + queue depths
+        // bound in-flight RAM: each 1 GiB dense volume slot and each queued
+        // encoded shard is ~1 GiB, so total slots ~= budget / 1 GiB.
+        int enc_threads = a.threads > 0 ? a.threads : 3;
+        int dl_threads = a.dl_threads > 0 ? a.dl_threads : enc_threads * 2;
+        int ul_threads = a.ul_threads > 0 ? a.ul_threads : enc_threads * 2;
+        if (dl_threads > 32) dl_threads = 32;
+        if (ul_threads > 32) ul_threads = 32;
+
+        // Split the RAM budget: dense-volume buffers (pool) get ~60%, encoded
+        // shard queue ~40%. Each ~1 GiB. Keep small minimums so tiny budgets work.
+        size_t total_slots = (size_t)(a.ram_budget_gb);
+        if (total_slots < 4) total_slots = 4;
+        size_t n_bufs = total_slots * 3 / 5; if (n_bufs < 2) n_bufs = 2;
+        size_t shard_depth = total_slots - n_bufs; if (shard_depth < 2) shard_depth = 2;
+
+        printf("L%d pools: dl=%d enc=%d ul=%d | %zu vol buffers, shard-queue depth %zu "
+               "(~%.0f GiB in-flight)\n",
+               level, dl_threads, enc_threads, ul_threads, n_bufs, shard_depth,
+               (double)(n_bufs + shard_depth));
+
+        buf_pool_init(&p.bufs, n_bufs);
+        bq_init(&p.vol_q, n_bufs);        // at most n_bufs volumes can be outstanding
+        bq_init(&p.shard_q, shard_depth);
 
         // Write the level metadata first so a reader sees a valid array.
-        if (upload_level_metadata(&base, padded, quality, tau) != 0)
+        if (upload_level_metadata(&p, padded, quality, tau) != 0)
             fprintf(stderr, "L%d: metadata upload failed (continuing)\n", level);
 
-        int nthreads = a.threads;
-        pthread_t *tids = (pthread_t *)malloc(nthreads * sizeof(pthread_t));
-        worker_ctx *ctxs = (worker_ctx *)malloc(nthreads * sizeof(worker_ctx));
-        for (int t = 0; t < nthreads; ++t) {
-            ctxs[t] = base;
-            ctxs[t].worker_id = t;
-            pthread_create(&tids[t], NULL, worker_main, &ctxs[t]);
-        }
-        for (int t = 0; t < nthreads; ++t) pthread_join(tids[t], NULL);
-        free(tids); free(ctxs);
+        pthread_t *dl = malloc(dl_threads * sizeof(pthread_t));
+        pthread_t *en = malloc(enc_threads * sizeof(pthread_t));
+        pthread_t *ul = malloc(ul_threads * sizeof(pthread_t));
+        for (int t = 0; t < ul_threads; ++t) pthread_create(&ul[t], NULL, upload_main, &p);
+        for (int t = 0; t < enc_threads; ++t) pthread_create(&en[t], NULL, compress_main, &p);
+        for (int t = 0; t < dl_threads; ++t) pthread_create(&dl[t], NULL, download_main, &p);
 
-        printf("L%d done: %zu ok, %zu failed of %zu (%zu whole-shard air-skips)\n",
-               level, atomic_load(&q.done), atomic_load(&q.failed), q.n,
-               atomic_load(&air_shards));
-        free(q.items);
-        pthread_mutex_destroy(&q.lock);
+        // Drain in stage order: downloads finish -> close vol_q -> compressors
+        // finish -> close shard_q -> uploaders finish.
+        for (int t = 0; t < dl_threads; ++t) pthread_join(dl[t], NULL);
+        bq_close(&p.vol_q);
+        for (int t = 0; t < enc_threads; ++t) pthread_join(en[t], NULL);
+        bq_close(&p.shard_q);
+        for (int t = 0; t < ul_threads; ++t) pthread_join(ul[t], NULL);
+        free(dl); free(en); free(ul);
+
+        printf("L%d done: %zu ok, %zu failed, %zu resume-skipped of %zu "
+               "(%zu whole-shard air-skips)\n",
+               level, atomic_load(&p.done), atomic_load(&p.failed),
+               atomic_load(&p.skipped), p.n_items, atomic_load(&p.air_shards));
+
+        // Free the buffer pool slots. All buffers are back in free_slots now
+        // (compress released each after encoding); close so the drain terminates.
+        bq_close(&p.bufs.free_slots);
+        void *b;
+        while (bq_pop(&p.bufs.free_slots, &b)) free(b);
+        bq_destroy(&p.bufs.free_slots);
+        bq_destroy(&p.vol_q);
+        bq_destroy(&p.shard_q);
+        free(p.items);
     }
 
     // Upload the OME group zarr.json once (references levels as multiscales).

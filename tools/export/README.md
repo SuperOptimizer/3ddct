@@ -3,23 +3,37 @@
 A bespoke, multithreaded C tool that recompresses an OME-Zarr scroll volume from
 the Vesuvius open-data S3 bucket into a dct3d-compressed, sharded **Zarr v3**
 volume and uploads it to an SFTP server — with **no Python / numcodecs in the
-loop**. Each worker thread owns one shard end to end: fetch → encode → upload →
-free.
+loop**.
 
-## Pipeline (per shard, one thread each)
+## Three-pool pipeline
 
-1. **Fetch** the source 128³ u8 chunks covering a `SHARD_VOX`³ (1024³) region via
-   libs3 batched ranged GETs, assembled into a dense volume (zero-padded past the
-   real extent).
-2. **Encode** the 64³ inner 16³ blocks with `dct3d_encode_u8` at the level's
-   (quality, tau), packed into a Zarr v3 `sharding_indexed` shard (inner 16³,
-   index_location=end, crc32c — byte-compatible with the `dct3d-zarr` reader).
-3. **Upload** the shard to `<root>/<scroll>/<vol>.zarr/<L>/<z>/<y>/<x>` over SFTP.
-4. **Free** the shard; move to the next.
+```
+[download pool] → [dense-volume queue] → [compress pool] → [shard queue] → [upload pool]
+   D threads          (bounded)            C threads         (bounded)        U threads
+   libs3 S3 fetch                          dct3d encode                       SFTP push
+```
+
+Each stage runs concurrently on its own resource — network-in, CPU, network-out —
+so compression never blocks on I/O. Bounded queues + a reusable 1 GiB **buffer
+pool** apply backpressure and cap in-flight RAM. Defaults from two knobs:
+`--threads N` sets the compress pool (CPU-bound) and download/upload default to
+`2N` (network-bound, mostly blocked); `--ram-budget-gb G` caps in-flight buffers
+(each dense 1024³ volume and each encoded shard is ~1 GiB). `mimalloc` replaces
+the system allocator to cut churn on those big buffers.
+
+Per shard: **fetch** the source 128³ u8 chunks covering a 1024³ region (libs3
+batched ranged GETs) into a dense pool buffer (zero-padded past the real extent);
+**encode** the 64³ inner 16³ blocks with `dct3d_encode_u8` at the level's
+(quality, tau) into a Zarr v3 `sharding_indexed` shard (inner 16³,
+index_location=end, crc32c — byte-compatible with the `dct3d-zarr` reader);
+**upload** to `<root>/<scroll>/<vol>.zarr/<L>/<z>/<y>/<x>` over SFTP.
 
 Array dims are padded up to a whole multiple of 1024, so every shard is a full
 1024³ (edge shards zero-filled). All-air inner chunks are stored as the sharding
 "missing" sentinel (no DCT, read back as fill_value=0).
+
+**Level 0 only by default** — pass `--levels` to export others. `--resume` skips
+shards already present on the server (SFTP stat), so an interrupted run continues.
 
 ## Air oracle (fast empty-region skip)
 
@@ -54,10 +68,12 @@ quality is picked from the volume's voxel size (parsed from the `--um` arg):
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # needs libcurl (+SSH), pthreads
-cmake --build build -j
+cmake --build build -j                           # mimalloc used if installed
 ```
 
 `dct3d.c` is compiled from the repo root; libs3 is vendored under `vendor/`.
+`mimalloc` is linked if found (recommended: `apt install libmimalloc-dev`); the
+build still works without it (system allocator).
 
 ## Usage
 
@@ -77,10 +93,19 @@ dct3d_export \
 Uploads land at `<remote-root>/<scroll>/<vol>/<L>/<z>/<y>/<x>` with a per-level
 `zarr.json` (dct3d sharding codec) and a group `zarr.json`.
 
-Flags: `--dry-run` (fetch+encode, no upload), `--limit-shards N` (first N),
-`--only-shard z,y,x` (a single shard, for testing), `--no-oracle`.
+Flags:
+- `--threads N` — compress-pool size (CPU-bound). Default 6.
+- `--ram-budget-gb G` — cap on in-flight ~1 GiB buffers. Default 10.
+- `--dl-threads N` / `--ul-threads N` — override download/upload pool sizes
+  (default `2×--threads`, capped at 32).
+- `--resume` — skip shards already on the server (continue an interrupted run).
+- `--levels 0` / `0-5` / `2` — which levels (default: 0 only).
+- `--dry-run` (fetch+encode, no upload), `--limit-shards N` (first N),
+  `--only-shard z,y,x` (a single shard, for testing), `--no-oracle`.
 
 ## Memory
 
-Each worker holds one 1 GiB dense volume + its shard output (~1.3 GiB peak), so
-`--threads` × ~1.3 GiB must fit RAM (≈6 threads on a 16 GB box).
+In-flight RAM is bounded by `--ram-budget-gb`: the buffer pool + shard queue hold
+at most that many ~1 GiB buffers total (≈10 GiB fits a 16 GB box with headroom
+for the OS and curl/TLS). Backpressure blocks downloads when the queues fill, so
+memory never runs away regardless of pool thread counts.
