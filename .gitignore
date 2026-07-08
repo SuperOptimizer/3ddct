@@ -53,3 +53,15 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Python packaging / cffi build artifacts
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+wheelhouse/
+dct3d_zarr/_dct3d.c
+dct3d_zarr/_dct3d*.so
+dct3d_zarr/_dct3d*.o
