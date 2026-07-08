@@ -10,8 +10,37 @@ standalone (`python build_dct3d.py`) for a local in-place build.
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
 
 from cffi import FFI
+
+
+def _c_std_flag() -> str | None:
+    """Pick a C standard flag the host compiler actually accepts.
+
+    dct3d.c targets C23, but the spelling differs by compiler version:
+    gcc >= 14 / clang >= 18 take ``-std=c23``; gcc 13 wants ``-std=c2x``.
+    Probe in preference order and return the first that compiles, or None
+    (let the compiler use its default — dct3d.c also builds under c17/gnu).
+    """
+    cc = os.environ.get("CC", "cc")
+    src = "int main(void){return 0;}"
+    for flag in ("-std=c23", "-std=c2x", "-std=gnu2x", "-std=c17"):
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                cf = os.path.join(d, "t.c")
+                with open(cf, "w") as fh:
+                    fh.write(src)
+                r = subprocess.run(
+                    [cc, flag, "-c", cf, "-o", os.path.join(d, "t.o")],
+                    capture_output=True,
+                )
+                if r.returncode == 0:
+                    return flag
+        except OSError:
+            break
+    return None
 
 # This builder lives at the dct3d repo root, alongside dct3d.c / dct3d.h. The
 # extension source is referenced by a REPO-RELATIVE path ("dct3d.c") on purpose:
@@ -57,10 +86,13 @@ ffibuilder.set_source(
     include_dirs=["."],
     # Match the library's intended build: C23 + fast-math autovectorization.
     # -ffast-math is safe here — the codec is explicitly tolerance-only and not
-    # bit-reproducible across builds (see dct3d.h). MSVC ignores these flags; its
-    # /fp:fast is applied via the extra_compile_args split below.
+    # bit-reproducible across builds (see dct3d.h). The C-std flag is probed
+    # (gcc 13 spells it -std=c2x, gcc 14+/clang -std=c23). MSVC ignores GCC-style
+    # flags, so it gets /O2 and its default (C17-ish) mode.
     extra_compile_args=(
-        ["/O2"] if os.name == "nt" else ["-std=c23", "-O3", "-ffast-math"]
+        ["/O2"]
+        if os.name == "nt"
+        else [f for f in (_c_std_flag(), "-O3", "-ffast-math") if f]
     ),
 )
 
