@@ -2,14 +2,42 @@
 
 #include "fetch.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "oracle.h"
 
+// Fleet-wide S3 throttle signal. Every throttled/short chunk bumps this; a
+// milestone log lets an operator see when a box is getting rate-limited (and
+// the per-chunk backoff below is easing it off automatically).
+static atomic_long g_throttle_events = 0;
+void fetch_note_throttle(void) {
+    long n = atomic_fetch_add(&g_throttle_events, 1) + 1;
+    if (n == 1 || n % 100 == 0)
+        fprintf(stderr, "THROTTLE: %ld throttled/short S3 reads so far "
+                "(backing off per-chunk)\n", n);
+}
+long fetch_throttle_count(void) { return atomic_load(&g_throttle_events); }
+
 #define SRC_CHUNK 128
 #define SRC_CHUNK3 ((size_t)SRC_CHUNK * SRC_CHUNK * SRC_CHUNK)
+
+// A response is "throttled" when S3 pushed back (429/500/503) or delivered a
+// truncated body (a real chunk arriving < its full size — seen under heavy
+// fleet-wide fan-out). Both are transient: retry the individual chunk with
+// backoff instead of hard-failing the whole shard.
+static int is_throttle_status(long s) { return s == 429 || s == 500 || s == 503; }
+
+static void backoff_sleep(int attempt) {
+    // 0.5s, 1s, 2s, 4s, ... capped at ~8s, so a throttled box eases off S3.
+    long ms = 500L << (attempt < 4 ? attempt : 4);
+    if (ms > 8000) ms = 8000;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
 
 // Scatter a fetched 128^3 source chunk into the dense SHARD_VOX^3 vol, clipped to
 // the shard bounds (a source chunk straddling the shard edge contributes only
@@ -93,25 +121,21 @@ int fetch_shard_region(s3_client *client, const src_level *lvl,
         // Batched concurrent GET. Transport-level failures -> S3_OK still, per-req
         // status inspected below.
         s3_status st = s3_get_batch(client, reqs, n, 0, resp);
-        if (st != S3_OK && st != S3_ERR_HTTP) {
-            fprintf(stderr, "fetch: s3_get_batch failed: %s\n", s3_status_str(st));
-            rc = -1;
-        } else {
-            for (size_t i = 0; i < n && rc == 0; ++i) {
-                long status = resp[i].status;
-                if (status == 404) {
-                    // omitted == air; leave zeros
-                    continue;
-                }
+        int batch_failed = (st != S3_OK && st != S3_ERR_HTTP);
+
+        // A chunk needs an individual retry if the batch failed wholesale, or it
+        // came back throttled (429/500/503) or short (truncated body). 404 = air.
+        // Persistent NoSuchKey and other 4xx are terminal (not retried).
+        for (size_t i = 0; i < n && rc == 0; ++i) {
+            long status = batch_failed ? 0 : resp[i].status;
+            int need_retry = batch_failed || is_throttle_status(status) ||
+                             (status >= 200 && status < 300 && resp[i].body_len != SRC_CHUNK3);
+
+            if (!need_retry) {
+                if (status == 404) continue;  // air
                 if (status < 200 || status >= 300) {
                     fprintf(stderr, "fetch: %s -> HTTP %ld (not 404) — hard error\n",
                             urls[i], status);
-                    rc = -1;
-                    break;
-                }
-                if (resp[i].body_len != SRC_CHUNK3) {
-                    fprintf(stderr, "fetch: %s -> %zu bytes (want %zu) — hard error\n",
-                            urls[i], resp[i].body_len, SRC_CHUNK3);
                     rc = -1;
                     break;
                 }
@@ -119,6 +143,45 @@ int fetch_shard_region(s3_client *client, const src_level *lvl,
                 int64_t ly = coords[i].cy * SRC_CHUNK - oy;
                 int64_t lx = coords[i].cx * SRC_CHUNK - ox;
                 scatter_chunk(vol, bufs + i * SRC_CHUNK3, lz, ly, lx);
+                continue;
+            }
+
+            // Individual retry with exponential backoff — eases off S3 when it's
+            // pushing back, and recovers truncated batched reads.
+            fetch_note_throttle();
+            int ok = 0;
+            for (int attempt = 0; attempt < 6; ++attempt) {
+                backoff_sleep(attempt);
+                s3_response r = {0};
+                s3_status rs = s3_get_range_into(client, urls[i], 0, SRC_CHUNK3,
+                                                 bufs + i * SRC_CHUNK3, &r);
+                long rstat = r.status;
+                size_t got = r.body_len;
+                s3_response_free(&r);
+                if (rstat == 404) { ok = 1; break; }              // air
+                if ((rs == S3_OK || rs == S3_ERR_HTTP) && rstat >= 200 &&
+                    rstat < 300 && got == SRC_CHUNK3) {
+                    int64_t lz = coords[i].cz * SRC_CHUNK - oz;
+                    int64_t ly = coords[i].cy * SRC_CHUNK - oy;
+                    int64_t lx = coords[i].cx * SRC_CHUNK - ox;
+                    scatter_chunk(vol, bufs + i * SRC_CHUNK3, lz, ly, lx);
+                    ok = 1;
+                    break;
+                }
+                if (!batch_failed && !is_throttle_status(rstat) &&
+                    !(rstat >= 200 && rstat < 300)) {
+                    // A genuine terminal error (e.g. 403/404-body) — stop retrying.
+                    fprintf(stderr, "fetch: %s -> HTTP %ld (terminal) — hard error\n",
+                            urls[i], rstat);
+                    break;
+                }
+                // else throttled/short — loop and back off further.
+            }
+            if (!ok) {
+                fprintf(stderr, "fetch: %s -> unrecovered after retries — hard error\n",
+                        urls[i]);
+                rc = -1;
+                break;
             }
         }
     }

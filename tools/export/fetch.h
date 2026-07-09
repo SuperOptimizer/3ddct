@@ -27,6 +27,10 @@ typedef struct {
 
 struct oracle_region;  // fwd decl (oracle.h); NULL when no oracle applies
 
+// Throttle telemetry (defined in fetch.c): bump on each throttled/short read.
+void fetch_note_throttle(void);
+long fetch_throttle_count(void);
+
 // Fill `vol` (SHARD_VOX^3, z-major, caller-allocated, pre-zeroed not required)
 // with the region whose origin is (oz,oy,ox) voxels into the level. Regions past
 // `shape` are zero-padded. `client` is a shared thread-safe s3_client. When

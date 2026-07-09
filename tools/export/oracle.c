@@ -8,10 +8,36 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SRC_CHUNK 128
 #define SRC_CHUNK3 ((size_t)SRC_CHUNK * SRC_CHUNK * SRC_CHUNK)
+
+static int is_throttle_status(long s) { return s == 429 || s == 500 || s == 503; }
+static void backoff_sleep(int attempt) {
+    long ms = 500L << (attempt < 4 ? attempt : 4);
+    if (ms > 8000) ms = 8000;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+// Retry one chunk into `dst` (SRC_CHUNK3) with backoff. Returns 1 on a full
+// read or 404-air (dst zeroed), 0 on terminal failure.
+static int retry_chunk(s3_client *c, const char *url, uint8_t *dst) {
+    for (int a = 0; a < 6; ++a) {
+        backoff_sleep(a);
+        s3_response r = {0};
+        s3_status rs = s3_get_range_into(c, url, 0, SRC_CHUNK3, dst, &r);
+        long st = r.status; size_t got = r.body_len;
+        s3_response_free(&r);
+        if (st == 404) { memset(dst, 0, SRC_CHUNK3); return 1; }
+        if ((rs == S3_OK || rs == S3_ERR_HTTP) && st >= 200 && st < 300 &&
+            got == SRC_CHUNK3)
+            return 1;
+        if (!is_throttle_status(st) && !(st >= 200 && st < 300)) return 0;  // terminal
+    }
+    return 0;
+}
 
 // The oracle region for a shard is ORACLE_EDGE=64 voxels/axis. At oracle level
 // those 64 voxels span oracle-voxel range [ooz, ooz+64) where ooz = oz/16.
@@ -81,21 +107,28 @@ int oracle_fetch(s3_client *client, const char *oracle_base, int oracle_level,
     int rc = 0;
     if (n > 0) {
         s3_status st = s3_get_batch(client, reqs, n, 0, resp);
-        if (st != S3_OK && st != S3_ERR_HTTP) { rc = -1; }
-        else {
-            for (size_t i = 0; i < n && rc == 0; ++i) {
-                long s = resp[i].status;
-                if (s == 404) continue;  // air
-                if (s < 200 || s >= 300 || resp[i].body_len != SRC_CHUNK3) {
-                    fprintf(stderr, "oracle: %s -> HTTP %ld / %zu bytes (hard error)\n",
-                            urls[i], s, resp[i].body_len);
+        int batch_failed = (st != S3_OK && st != S3_ERR_HTTP);
+        for (size_t i = 0; i < n && rc == 0; ++i) {
+            long s = batch_failed ? 0 : resp[i].status;
+            int short_or_throttled = batch_failed || is_throttle_status(s) ||
+                                     (s >= 200 && s < 300 && resp[i].body_len != SRC_CHUNK3);
+            if (short_or_throttled) {
+                fetch_note_throttle();
+                if (!retry_chunk(client, urls[i], bufs + i * SRC_CHUNK3)) {
+                    fprintf(stderr, "oracle: %s -> unrecovered after retries\n", urls[i]);
                     rc = -1; break;
                 }
-                scatter(out->vox, bufs + i * SRC_CHUNK3,
-                        coords[i].cz * SRC_CHUNK - ooz,
-                        coords[i].cy * SRC_CHUNK - ooy,
-                        coords[i].cx * SRC_CHUNK - oox);
+            } else {
+                if (s == 404) continue;  // air
+                if (s < 200 || s >= 300) {
+                    fprintf(stderr, "oracle: %s -> HTTP %ld (hard error)\n", urls[i], s);
+                    rc = -1; break;
+                }
             }
+            scatter(out->vox, bufs + i * SRC_CHUNK3,
+                    coords[i].cz * SRC_CHUNK - ooz,
+                    coords[i].cy * SRC_CHUNK - ooy,
+                    coords[i].cx * SRC_CHUNK - oox);
         }
     }
     for (size_t i = 0; i < n; ++i) s3_response_free(&resp[i]);
@@ -205,13 +238,33 @@ int oracle_map_build(s3_client *client, const char *vol_base, int oracle_level,
                         reqs[n] = (s3_range_req){urls[n], 0, SRC_CHUNK3, bufs + n * SRC_CHUNK3};
                     }
                     s3_status s = s3_get_batch(client, reqs, n, 0, resp);
-                    if (s != S3_OK && s != S3_ERR_HTTP) { rc = -1; }
-                    else for (size_t i = 0; i < n; ++i) {
-                        long code = resp[i].status;
-                        if (code == 404) { air++; }
-                        else if (code >= 200 && code < 300 && resp[i].body_len == SRC_CHUNK3) {
+                    int batch_failed = (s != S3_OK && s != S3_ERR_HTTP);
+                    for (size_t i = 0; i < n; ++i) {
+                        long code = batch_failed ? 0 : resp[i].status;
+                        int retry = batch_failed || is_throttle_status(code) ||
+                                    (code >= 200 && code < 300 &&
+                                     resp[i].body_len != SRC_CHUNK3);
+                        if (code == 404 && !retry) { air++; }
+                        else if (!retry && code >= 200 && code < 300) {
                             scatter_dense(dense, shp, coords[i][0], coords[i][1],
                                           coords[i][2], bufs + i * SRC_CHUNK3);
+                        } else if (retry) {
+                            // Throttled/short during a 20-30 GB L4 download: retry
+                            // the chunk with backoff rather than aborting the map.
+                            fetch_note_throttle();
+                            uint8_t *tmp = malloc(SRC_CHUNK3);
+                            if (tmp && retry_chunk(client, urls[i], tmp)) {
+                                int allzero = 1;
+                                for (size_t b = 0; b < SRC_CHUNK3; ++b)
+                                    if (tmp[b]) { allzero = 0; break; }
+                                if (allzero) air++;
+                                else scatter_dense(dense, shp, coords[i][0],
+                                                   coords[i][1], coords[i][2], tmp);
+                            } else {
+                                fprintf(stderr, "oracle_map: %s -> unrecovered\n", urls[i]);
+                                rc = -1;
+                            }
+                            free(tmp);
                         } else {
                             fprintf(stderr, "oracle_map: %s -> HTTP %ld / %zu B (hard)\n",
                                     urls[i], code, resp[i].body_len);
