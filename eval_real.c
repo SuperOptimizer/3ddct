@@ -12,6 +12,7 @@
 
 #include "dct3d.h"
 #include "deblock.h"
+#include "lapped.h"
 #include "predeblock.h"
 
 #include <math.h>
@@ -123,7 +124,9 @@ int main(int argc, char **argv) {
     }
 
     uint8_t *volP = malloc(VOX), *volE = malloc(VOX), *volD = malloc(VOX), *volB = malloc(VOX);
+    uint8_t *volL = malloc(VOX), *pref = malloc(VOX);
     uint8_t blob[DCT3D_MAX_BYTES], blk[DCT3D_N3], back[DCT3D_N3];
+    const size_t vdims[3] = { D, D, D };
 
     // export ladder points + a harsher one, and an enc-strength sweep at q=32.
     struct { float q, tau, encs, decs; const char *tag; } runs[] = {
@@ -159,13 +162,28 @@ int main(int argc, char **argv) {
         deblock_chunks(volP, volD, q, ds);
         deblock_chunks(volE, volB, q, ds);
 
+        // lapped: prefilter source -> plain per-block codec -> postfilter
+        size_t bytesL = 0;
+        memcpy(pref, orig, VOX);
+        dct3d_lap_prefilter_u8(pref, vdims);
+        for (int bz = 0; bz < GB; ++bz) for (int by = 0; by < GB; ++by) for (int bx = 0; bx < GB; ++bx) {
+            get_block(pref, bz, by, bx, blk);
+            size_t n = dct3d_encode_u8(blk, q, 0, tau, blob); bytesL += n;
+            dct3d_decode_u8(blob, n, back);
+            put_block(volL, bz, by, bx, back);
+        }
+        dct3d_lap_postfilter_u8(volL, vdims);
+
         double s0 = seam_energy(orig);
         double sP = seam_energy(volP), sE = seam_energy(volE), sD = seam_energy(volD), sB = seam_energy(volB);
+        double sL = seam_energy(volL);
         double eP = mse(orig, volP), eE = mse(orig, volE), eD = mse(orig, volD), eB = mse(orig, volB);
+        double eL = mse(orig, volL);
         printf("%-9s plain       %6.2f  %6.2f  %6.2f  %5.2f  %7zu\n", runs[r].tag, sP, sP - s0, eP, psnr(eP), bytesP);
         printf("          enc-side    %6.2f  %6.2f  %6.2f  %5.2f  %7zu (odd: %zu vs plain %zu)\n", sE, sE - s0, eE, psnr(eE), bytesP - bytesPodd + bytesE, bytesE, bytesPodd);
         printf("          dec-side    %6.2f  %6.2f  %6.2f  %5.2f\n", sD, sD - s0, eD, psnr(eD));
         printf("          both        %6.2f  %6.2f  %6.2f  %5.2f\n", sB, sB - s0, eB, psnr(eB));
+        printf("          lapped      %6.2f  %6.2f  %6.2f  %5.2f  %7zu\n", sL, sL - s0, eL, psnr(eL), bytesL);
 
         if (r < 3) {   // slice dumps for the ladder points
             char nm[64]; int zs = 64;
@@ -174,8 +192,9 @@ int main(int argc, char **argv) {
             snprintf(nm, sizeof nm, "%s_enc", runs[r].tag);   write_pgm(outdir, nm, volE, zs);
             snprintf(nm, sizeof nm, "%s_dec", runs[r].tag);   write_pgm(outdir, nm, volD, zs);
             snprintf(nm, sizeof nm, "%s_both", runs[r].tag);  write_pgm(outdir, nm, volB, zs);
+            snprintf(nm, sizeof nm, "%s_lap", runs[r].tag);   write_pgm(outdir, nm, volL, zs);
         }
     }
-    free(orig); free(volP); free(volE); free(volD); free(volB);
+    free(orig); free(volP); free(volE); free(volD); free(volB); free(volL); free(pref);
     return 0;
 }

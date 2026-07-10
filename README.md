@@ -201,6 +201,21 @@ value steps across the 16-voxel block grid. Two complementary tools address it
 The two compose (enc-side at write, dec-side at read), but when combined,
 lower the decode-side `strength` — each already closes part of the same seam.
 
+**Lapped transforms: evaluated, negative result (for now).**
+[`lapped.h/.c`](lapped.h) implements a TDLT-style boundary pre/post filter pair
+(Tran/Tu/Liang butterfly, diagonal antisymmetric scaling, separable 3D; perfect
+reconstruction verified). On real scroll CT it *loses* to plain coding at every
+scale strength tried: the post-filter's 1/s synthesis gain amplifies
+quantization noise in the boundary bands (q32: seam energy ×2.2, MSE +54 % at
+the classic scales; still worse at near-identity scales), and the expected rate
+win never appears because the per-block value-range normalization and trained
+coder priors already absorb what the pre-filter decorrelates. A proper
+orthogonal LOT (rotation-based, quantizer-matched) might behave differently,
+but the bar it must clear — the decode-side filter's −98 % seam excess *plus*
+PSNR gain at q64 — is above typical lapped blocking gains. The code stays as a
+reproducible experiment (`eval_real.c` has the harness); it is not part of the
+format.
+
 ## Notes & caveats
 
 - **Lossy.** Reconstruction is close, not bit-exact.
