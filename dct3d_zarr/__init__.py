@@ -8,9 +8,10 @@ the ``dct3d`` codec just works after ``pip install dct3d-zarr``.
 
 from __future__ import annotations
 
+from ._lowlevel import deblock
 from .codec import CODEC_NAME, Dct3dCodec, register
 
-__all__ = ["CODEC_NAME", "Dct3dCodec", "register"]
+__all__ = ["CODEC_NAME", "Dct3dCodec", "deblock", "register"]
 
 # Register on import. The entry point (pyproject.toml) points zarr's registry at
 # `dct3d_zarr:Dct3dCodec`; importing the package is idempotent-safe regardless.

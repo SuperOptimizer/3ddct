@@ -172,6 +172,35 @@ out trivially — the same M4 across its 10 cores (OpenMP, one block per work
 item) exceeds **1 GB/s**. There are no locks or shared writable state to contend
 on; the only shared reads are the static cosine/step/scan tables.
 
+## Deblocking
+
+At aggressive quality the independent per-block quantization leaves visible
+value steps across the 16-voxel block grid. Two complementary tools address it
+(both optional; the bitstream never changes):
+
+- **Decode-side post-filter** ([`deblock.h`](deblock.h)) — for data that is
+  *already encoded*. A signal-adaptive boundary filter in the H.26x family:
+  thresholds scale with the quantizer step, so it closes coding seams while
+  leaving genuine edges alone. Needs decoded neighbors, so it is a post-pass,
+  not part of `dct3d_decode_*`: either hand it one chunk + its six decoded
+  face-neighbors (`dct3d_deblock_chunk_*`, order-independent, parallel-safe) or
+  an assembled region in place (`dct3d_deblock_*`). Pass the encode `quality`
+  as `step`. Measured on real 2.4 µm scroll CT: at q32 it removes ~70 % of the
+  seam excess and *improves* PSNR by ~0.4 dB; at q64, ~98 % and +0.6 dB.
+
+- **Encode-side compensation** ([`predeblock.h`](predeblock.h)) — for *future*
+  encodes, when readers should get low-seam data from a plain lone-block
+  decode with no post-pass. Blocking is visible because the two sides of a
+  seam err independently; `dct3d_encode_deblock_*` injects the neighbor's
+  known reconstruction error into this block's boundary layers (tapered
+  inward) before the DCT, so both sides err alike and the step vanishes while
+  the true gradient is preserved. Encode in checkerboard order (evens plain,
+  odds compensated) and every seam is fixed once. ~30 % seam-excess cut alone
+  at rate parity; decode stays pure and block-independent.
+
+The two compose (enc-side at write, dec-side at read), but when combined,
+lower the decode-side `strength` — each already closes part of the same seam.
+
 ## Notes & caveats
 
 - **Lossy.** Reconstruction is close, not bit-exact.

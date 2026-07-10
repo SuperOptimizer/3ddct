@@ -108,6 +108,18 @@ for ctype, name in _TYPES:
     cdefs.append(
         f"int dct3d_decode_{name}(const uint8_t *blob, size_t len, {ctype} *chunk);"
     )
+    # decode-side deblocking post-filters (deblock.h)
+    cdefs.append(
+        f"void dct3d_deblock_{name}({ctype} *vol, const size_t dims[3], "
+        f"float step, float strength);"
+    )
+    cdefs.append(
+        f"void dct3d_deblock_chunk_{name}(const {ctype} *chunk, "
+        f"const {ctype} *xlo, const {ctype} *xhi, "
+        f"const {ctype} *ylo, const {ctype} *yhi, "
+        f"const {ctype} *zlo, const {ctype} *zhi, "
+        f"float step, float strength, {ctype} *out);"
+    )
 # DCT3D_N3 * 8 + 256 worst-case, surfaced as a plain constant for the caller's
 # scratch buffer (kept in sync with dct3d.h; asserted against the header below).
 cdefs.append("#define DCT3D_MAX_BYTES ...")
@@ -118,8 +130,8 @@ ffibuilder.cdef("\n".join(cdefs))
 
 ffibuilder.set_source(
     "dct3d_zarr._dct3d",
-    '#include "dct3d.h"',
-    sources=["dct3d.c"],  # relative to the repo root (the sdist/build cwd)
+    '#include "dct3d.h"\n#include "deblock.h"',
+    sources=["dct3d.c", "deblock.c"],  # relative to the repo root
     include_dirs=["."],
     # Match the library's intended build: C23 + fast-math autovectorization.
     # -ffast-math is safe here — the codec is explicitly tolerance-only and not

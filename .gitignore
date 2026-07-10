@@ -65,3 +65,7 @@ wheelhouse/
 dct3d_zarr/_dct3d.c
 dct3d_zarr/_dct3d*.so
 dct3d_zarr/_dct3d*.o
+
+# local eval artifacts
+eval-data/
+.DS_Store

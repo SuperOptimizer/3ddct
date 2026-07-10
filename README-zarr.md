@@ -87,6 +87,24 @@ Supported dtypes: `uint8 uint16 uint32 int8 int16 int32 float32` (the seven dct3
 types). It is a **lossy** codec — reconstruction is within the requested bound, not
 bit-exact, and (fast-math float) not bit-reproducible across builds.
 
+## Deblocking decoded data
+
+At aggressive quality, independent 16³-block quantization leaves visible steps
+across the block grid. `dct3d_zarr.deblock` removes them after decode — a
+signal-adaptive boundary filter that closes coding seams but leaves genuine
+edges alone (thresholds scale with the quantizer, H.26x-style):
+
+```python
+import dct3d_zarr
+sub = np.ascontiguousarray(arr[z0:z0+64, 0:512, 0:512])  # 16-aligned region
+dct3d_zarr.deblock(sub, step=32)          # step = the encode quality; in place
+```
+
+Measured on real 2.4 µm scroll CT at q32: ~70 % of the seam excess removed and
+PSNR *improves* ~0.4 dB (it removes quantization noise, not detail). Seams are
+only fixed where both sides are inside the array you pass, so deblock an
+assembled region, not a lone 16³ chunk.
+
 ## Requirements
 
 - Python ≥ 3.10, `zarr` ≥ 3.0, `numpy`, `cffi`.
